@@ -11,6 +11,10 @@ const props = defineProps<{
   isSaving: boolean;
   error: string | null;
   success: boolean;
+  isGeneratingReport: boolean;
+  reportContent: string;
+  reportPeriod: 'weekly' | 'monthly';
+  reportError: string | null;
 }>();
 
 const emit = defineEmits<{
@@ -22,6 +26,7 @@ const emit = defineEmits<{
   'update:aiModel': [value: string];
   'update:aiBaseUrl': [value: string];
   'update:aiApiKey': [value: string];
+  'generate-report': [period: 'weekly' | 'monthly'];
 }>();
 
 function updateInput(name: 'theme' | 'dataLocation' | 'aiModel' | 'aiBaseUrl' | 'aiApiKey', event: Event) {
@@ -35,6 +40,10 @@ function updateInput(name: 'theme' | 'dataLocation' | 'aiModel' | 'aiBaseUrl' | 
 
 function updateDataFormat(event: Event) {
   emit('update:dataFormat', (event.target as HTMLInputElement).value as 'json' | 'sqlite');
+}
+
+function reportPeriodLabel(period: 'weekly' | 'monthly') {
+  return period === 'weekly' ? '周报' : '月报';
 }
 </script>
 
@@ -156,6 +165,31 @@ function updateDataFormat(event: Event) {
                   @input="updateInput('aiBaseUrl', $event)"
                 />
               </div>
+              <div class="report-actions">
+                <button
+                  class="btn-primary report-btn"
+                  type="button"
+                  :disabled="props.isGeneratingReport"
+                  @click="emit('generate-report', 'weekly')"
+                >
+                  <span v-if="props.isGeneratingReport && props.reportPeriod === 'weekly'">生成中...</span>
+                  <span v-else>生成周报</span>
+                </button>
+                <button
+                  class="btn-ghost report-btn"
+                  type="button"
+                  :disabled="props.isGeneratingReport"
+                  @click="emit('generate-report', 'monthly')"
+                >
+                  <span v-if="props.isGeneratingReport && props.reportPeriod === 'monthly'">生成中...</span>
+                  <span v-else>生成月报</span>
+                </button>
+              </div>
+              <div v-if="props.reportError" class="settings-alert settings-alert-error">⚠️ {{ props.reportError }}</div>
+              <div v-if="props.reportContent" class="report-preview">
+                <h4 class="report-preview-title">AI {{ reportPeriodLabel(props.reportPeriod) }}预览</h4>
+                <pre class="report-preview-content">{{ props.reportContent }}</pre>
+              </div>
             </div>
           </div>
 
@@ -260,6 +294,43 @@ function updateDataFormat(event: Event) {
 .settings-desc {
   margin: 0;
   line-height: 1.5;
+}
+
+.report-actions {
+  display: flex;
+  gap: 10px;
+}
+
+.report-btn {
+  min-width: 112px;
+}
+
+.report-preview {
+  margin-top: 4px;
+  border: 1px solid var(--c-border-light);
+  border-radius: 10px;
+  background: var(--c-bg-app);
+  overflow: hidden;
+}
+
+.report-preview-title {
+  margin: 0;
+  padding: 10px 12px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--c-text-secondary);
+  border-bottom: 1px solid var(--c-border-light);
+}
+
+.report-preview-content {
+  margin: 0;
+  padding: 12px;
+  max-height: 220px;
+  overflow: auto;
+  font-size: 0.82rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  color: var(--c-text-primary);
 }
 
 .author-card {

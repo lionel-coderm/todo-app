@@ -1,7 +1,6 @@
-import Fuse from 'fuse.js';
 import type { IFuseOptions } from 'fuse.js';
 import type { CategoryItem, TodoItem } from '@/data/todos';
-import { searchSqliteTodos, type SearchFilter } from '@/services/storageService';
+import type { SearchFilter } from '@/services/storageService';
 
 export interface SearchTodosParams {
   storageType: 'json' | 'sqlite';
@@ -17,6 +16,8 @@ interface SearchableTodo {
   todo: TodoItem;
   categoryName: string;
 }
+
+let fuseConstructorPromise: Promise<(typeof import('fuse.js'))['default']> | null = null;
 
 const fuseOptions: IFuseOptions<SearchableTodo> = {
   includeScore: true,
@@ -60,6 +61,21 @@ function applyFilters(
   return result;
 }
 
+export function filterTodos(
+  todos: TodoItem[],
+  filter: SearchFilter,
+  selectedCategoryId: string | null,
+) {
+  return applyFilters(todos, filter, selectedCategoryId);
+}
+
+async function getFuseConstructor() {
+  if (!fuseConstructorPromise) {
+    fuseConstructorPromise = import('fuse.js').then((module) => module.default);
+  }
+  return fuseConstructorPromise;
+}
+
 function searchJsonTodos({
   todos,
   categories,
@@ -68,11 +84,19 @@ function searchJsonTodos({
   selectedCategoryId,
 }: Omit<SearchTodosParams, 'storageType'>) {
   const filteredTodos = applyFilters(todos, filter, selectedCategoryId);
-  const normalizedQuery = query.trim();
+  return { filteredTodos, normalizedQuery: query.trim(), categories };
+}
 
-  if (!normalizedQuery) {
-    return filteredTodos;
-  }
+async function runFuseSearch({
+  filteredTodos,
+  categories,
+  normalizedQuery,
+}: {
+  filteredTodos: TodoItem[];
+  categories: CategoryItem[];
+  normalizedQuery: string;
+}) {
+  const Fuse = await getFuseConstructor();
 
   const categoryNameById = new Map(categories.map((category) => [category.id, category.name]));
   const fuse = new Fuse(
@@ -87,14 +111,9 @@ function searchJsonTodos({
 }
 
 export async function searchTodos(params: SearchTodosParams): Promise<TodoItem[]> {
-  if (params.storageType === 'sqlite') {
-    return searchSqliteTodos({
-      query: params.query,
-      filter: params.filter,
-      selectedCategoryId: params.selectedCategoryId,
-      sortOrder: params.sortOrder,
-    });
+  const localResult = searchJsonTodos(params);
+  if (!localResult.normalizedQuery) {
+    return localResult.filteredTodos;
   }
-
-  return searchJsonTodos(params);
+  return runFuseSearch(localResult);
 }

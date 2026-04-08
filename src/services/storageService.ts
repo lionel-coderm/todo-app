@@ -11,6 +11,9 @@ export interface AppData {
 export interface AppSettings {
   storageType: 'json' | 'sqlite';
   dataDir?: string; // 自定义数据目录，undefined 或空字符串 = 系统默认
+  aiModel?: string;
+  aiBaseUrl?: string;
+  aiApiKey?: string;
 }
 
 export type SearchFilter = 'all' | 'active' | 'completed' | 'trash';
@@ -29,6 +32,8 @@ export interface CreateTodoInput {
   description?: string;
   createdAt?: string;
 }
+
+export type ReportPeriod = 'weekly' | 'monthly';
 
 // ─── 存储服务 ──────────────────────────────────────────
 
@@ -58,6 +63,10 @@ export async function loadSettings(): Promise<AppSettings> {
  */
 export async function saveSettings(settings: AppSettings, data: AppData): Promise<void> {
   return invoke('save_settings', { settings, data });
+}
+
+export async function generateAiReport(period: ReportPeriod): Promise<string> {
+  return invoke<string>('generate_ai_report', { period });
 }
 
 /**
@@ -105,4 +114,8 @@ export async function deleteSqliteCategory(id: string): Promise<void> {
  */
 export async function getDefaultDataDir(): Promise<string> {
   return invoke<string>('get_default_data_dir');
+}
+
+export async function showMainWindow(): Promise<void> {
+  return invoke('show_main_window');
 }

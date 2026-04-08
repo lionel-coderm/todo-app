@@ -42,6 +42,15 @@ pub struct AppSettings {
     /// 自定义数据目录，None 或空字符串表示使用系统默认目录
     #[serde(rename = "dataDir", skip_serializing_if = "Option::is_none")]
     pub data_dir: Option<String>,
+    /// AI 报告生成配置：模型名（例如 gpt-4o）
+    #[serde(rename = "aiModel", skip_serializing_if = "Option::is_none")]
+    pub ai_model: Option<String>,
+    /// AI 报告生成配置：API Base URL（例如 https://api.openai.com/v1）
+    #[serde(rename = "aiBaseUrl", skip_serializing_if = "Option::is_none")]
+    pub ai_base_url: Option<String>,
+    /// AI 报告生成配置：API Key
+    #[serde(rename = "aiApiKey", skip_serializing_if = "Option::is_none")]
+    pub ai_api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +80,9 @@ impl Default for AppSettings {
         Self {
             storage_type: "json".to_string(),
             data_dir: None,
+            ai_model: None,
+            ai_base_url: None,
+            ai_api_key: None,
         }
     }
 }

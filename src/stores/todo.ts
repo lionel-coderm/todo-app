@@ -8,23 +8,19 @@ import {
   type TodoItem,
   type CategoryItem,
 } from '@/data/todos';
-import { searchTodos } from '@/services/searchService';
+import { filterTodos, searchTodos } from '@/services/searchService';
 import {
-  addSqliteCategory,
-  addSqliteTodo,
-  deleteSqliteCategory,
-  deleteSqliteTodo,
   loadAppData,
   saveAppData,
   loadSettings,
   saveSettings,
-  toggleSqliteTodo,
-  updateSqliteCategory,
-  updateSqliteTodo,
   type AppSettings,
-  type CreateTodoInput,
   type SearchFilter,
 } from '@/services/storageService';
+import {
+  createTodoMutationStrategies,
+  type TodoMutationStrategy,
+} from '@/stores/todoMutationStrategy';
 
 function normalizePriority(priority: unknown): TaskPriority {
   if (isTaskPriority(priority)) {
@@ -69,11 +65,71 @@ function normalizeTodos(todos: TodoItem[]) {
   return todos.map(normalizeTodo);
 }
 
+const APP_CACHE_KEY = 'todo-studio-cache-v1';
+
+interface AppCacheSnapshot {
+  todos: TodoItem[];
+  categories: CategoryItem[];
+  settings: AppSettings;
+}
+
+interface IdleDeadlineLike {
+  didTimeout: boolean;
+  timeRemaining: () => number;
+}
+
+type IdleCallbackHandle = number;
+type RequestIdleCallbackLike = (
+  callback: (deadline: IdleDeadlineLike) => void,
+  options?: { timeout: number }
+) => IdleCallbackHandle;
+type CancelIdleCallbackLike = (handle: IdleCallbackHandle) => void;
+
+function readAppCache(): AppCacheSnapshot | null {
+  if (typeof window === 'undefined') {
+    return null;
+  }
+
+  try {
+    const raw = window.localStorage.getItem(APP_CACHE_KEY);
+    if (!raw) {
+      return null;
+    }
+
+    const parsed = JSON.parse(raw) as Partial<AppCacheSnapshot>;
+    if (!Array.isArray(parsed.todos) || !Array.isArray(parsed.categories) || !parsed.settings) {
+      return null;
+    }
+
+    return {
+      todos: parsed.todos,
+      categories: parsed.categories,
+      settings: parsed.settings,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writeAppCache(snapshot: AppCacheSnapshot) {
+  if (typeof window === 'undefined') {
+    return;
+  }
+
+  try {
+    window.localStorage.setItem(APP_CACHE_KEY, JSON.stringify(snapshot));
+  } catch {
+    // 忽略缓存写入失败，不能影响主流程
+  }
+}
+
 // ─── Store ─────────────────────────────────────────────
 
 export const useTodoStore = defineStore('todo', () => {
   let saveTimer: ReturnType<typeof setTimeout> | null = null;
   let searchTimer: ReturnType<typeof setTimeout> | null = null;
+  let cacheTimer: ReturnType<typeof setTimeout> | null = null;
+  let cacheIdleHandle: IdleCallbackHandle | null = null;
 
   function debouncedSave(fn: () => void, delay = 500) {
     if (saveTimer !== null) clearTimeout(saveTimer);
@@ -91,6 +147,66 @@ export const useTodoStore = defineStore('todo', () => {
     }, delay);
   }
 
+  function cancelPendingSearch() {
+    if (searchTimer !== null) {
+      clearTimeout(searchTimer);
+      searchTimer = null;
+    }
+  }
+
+  function flushAppCache() {
+    writeAppCache({
+      todos: todos.value,
+      categories: categories.value,
+      settings: currentSettings.value,
+    });
+  }
+
+  function cancelPendingCacheWrite() {
+    if (cacheTimer !== null) {
+      clearTimeout(cacheTimer);
+      cacheTimer = null;
+    }
+
+    if (cacheIdleHandle !== null && typeof window !== 'undefined') {
+      const idleWindow = window as Window & {
+        cancelIdleCallback?: CancelIdleCallbackLike;
+      };
+      idleWindow.cancelIdleCallback?.(cacheIdleHandle);
+      cacheIdleHandle = null;
+    }
+  }
+
+  function scheduleCacheWrite(delay = 900) {
+    cancelPendingCacheWrite();
+
+    cacheTimer = setTimeout(() => {
+      cacheTimer = null;
+
+      if (typeof window === 'undefined') {
+        flushAppCache();
+        return;
+      }
+
+      const idleWindow = window as Window & {
+        requestIdleCallback?: RequestIdleCallbackLike;
+      };
+
+      if (typeof idleWindow.requestIdleCallback === 'function') {
+        cacheIdleHandle = idleWindow.requestIdleCallback(
+          () => {
+            cacheIdleHandle = null;
+            flushAppCache();
+          },
+          { timeout: 1500 },
+        );
+        return;
+      }
+
+      flushAppCache();
+    }, delay);
+  }
+
   onScopeDispose(() => {
     if (saveTimer !== null) {
       clearTimeout(saveTimer);
@@ -100,6 +216,7 @@ export const useTodoStore = defineStore('todo', () => {
       clearTimeout(searchTimer);
       searchTimer = null;
     }
+    cancelPendingCacheWrite();
   });
 
   const categories = ref<CategoryItem[]>([]);
@@ -116,7 +233,16 @@ export const useTodoStore = defineStore('todo', () => {
   const isSearching = ref(false);
   const storageError = ref<string | null>(null);
   const currentSettings = ref<AppSettings>({ storageType: 'json' });
-  let activeSearchToken = 0;
+  const cachedSnapshot = readAppCache();
+
+  if (cachedSnapshot) {
+    todos.value = normalizeTodos(cachedSnapshot.todos);
+    categories.value = cachedSnapshot.categories;
+    currentSettings.value = {
+      ...currentSettings.value,
+      ...cachedSnapshot.settings,
+    };
+  }
 
   function applySortOrder(items: TodoItem[]): TodoItem[] {
     const sorted = [...items];
@@ -135,8 +261,18 @@ export const useTodoStore = defineStore('todo', () => {
     return sorted;
   }
 
-  async function refreshVisibleTodosFromMemory() {
+  function refreshVisibleTodosSync() {
+    const filtered = filterTodos(todos.value, filter.value, selectedCategoryId.value);
+    visibleTodos.value = applySortOrder(filtered);
+  }
+
+  async function refreshVisibleTodos() {
     try {
+      if (!searchQuery.value.trim()) {
+        refreshVisibleTodosSync();
+        return;
+      }
+
       const result = await searchTodos({
         storageType: 'json',
         todos: todos.value,
@@ -146,69 +282,60 @@ export const useTodoStore = defineStore('todo', () => {
         selectedCategoryId: selectedCategoryId.value,
         sortOrder: sortOrder.value,
       });
-      visibleTodos.value = applySortOrder(normalizeTodos(result));
+      visibleTodos.value = applySortOrder(result);
     } catch (err) {
       storageError.value = String(err);
       visibleTodos.value = [];
     }
   }
 
-  async function refreshVisibleTodos() {
-    const searchToken = ++activeSearchToken;
-    const shouldSearchRemotely = currentSettings.value.storageType === 'sqlite';
-
-    if (shouldSearchRemotely) {
-      isSearching.value = true;
-    }
-
-    try {
-      const result = await searchTodos({
-        storageType: currentSettings.value.storageType,
-        todos: todos.value,
-        categories: categories.value,
-        query: searchQuery.value,
-        filter: filter.value,
-        selectedCategoryId: selectedCategoryId.value,
-        sortOrder: sortOrder.value,
-      });
-
-      if (searchToken !== activeSearchToken) return;
-      visibleTodos.value = applySortOrder(normalizeTodos(result));
-    } catch (err) {
-      if (searchToken !== activeSearchToken) return;
-      storageError.value = String(err);
-      visibleTodos.value = [];
-    } finally {
-      if (searchToken === activeSearchToken) {
-        isSearching.value = false;
-      }
-    }
-  }
+  refreshVisibleTodosSync();
 
   watch(
-    [filter, selectedCategoryId, searchQuery, sortOrder, () => currentSettings.value.storageType],
+    [filter, selectedCategoryId, sortOrder],
     () => {
-      if (currentSettings.value.storageType === 'sqlite') {
-        debounceSearch(() => {
-          void refreshVisibleTodos();
-        });
-        return;
-      }
-
-      void refreshVisibleTodos();
+      cancelPendingSearch();
+      refreshVisibleTodosSync();
     },
   );
+
+  watch(searchQuery, () => {
+    if (!searchQuery.value.trim()) {
+      cancelPendingSearch();
+      refreshVisibleTodosSync();
+      return;
+    }
+
+    debounceSearch(() => {
+      void refreshVisibleTodos();
+    });
+  });
+
+  watch(() => currentSettings.value.storageType, () => {
+    cancelPendingSearch();
+    if (!searchQuery.value.trim()) {
+      refreshVisibleTodosSync();
+      return;
+    }
+    void refreshVisibleTodos();
+  });
 
   watch(
     [todos, categories],
     () => {
-      if (currentSettings.value.storageType === 'sqlite') {
-        // SQLite 场景先用内存数据刷新界面，避免写入前查询旧库造成“点击无效果”。
-        void refreshVisibleTodosFromMemory();
+      if (!searchQuery.value.trim()) {
+        refreshVisibleTodosSync();
         return;
       }
-
       void refreshVisibleTodos();
+    },
+    { deep: true },
+  );
+
+  watch(
+    [todos, categories, currentSettings],
+    () => {
+      scheduleCacheWrite();
     },
     { deep: true },
   );
@@ -228,17 +355,14 @@ export const useTodoStore = defineStore('todo', () => {
     }
 
     debouncedSave(() => {
-      saveAppData({ todos: todos.value, categories: categories.value })
-        .then(() => {
-          // SQLite 模式下列表来自数据库搜索，保存后需要再拉一次以避免显示旧结果。
-          if (currentSettings.value.storageType === 'sqlite') {
-            return refreshVisibleTodos();
-          }
-          return undefined;
-        })
-        .catch((err) => {
-          storageError.value = String(err);
-        });
+      // 防抖期间可能切换到 SQLite，执行前再次检查避免写入错误后端。
+      if (currentSettings.value.storageType === 'sqlite') {
+        return;
+      }
+
+      saveAppData({ todos: todos.value, categories: categories.value }).catch((err) => {
+        storageError.value = String(err);
+      });
     });
   }
 
@@ -248,11 +372,11 @@ export const useTodoStore = defineStore('todo', () => {
     isLoading.value = true;
     storageError.value = null;
     try {
-      // 先读设置，再读数据
-      const settings = await loadSettings();
+      const [settings, data] = await Promise.all([
+        loadSettings(),
+        loadAppData(),
+      ]);
       currentSettings.value = settings;
-
-      const data = await loadAppData();
 
       if (data.todos.length > 0 || data.categories.length > 0) {
         todos.value = normalizeTodos(data.todos);
@@ -265,14 +389,25 @@ export const useTodoStore = defineStore('todo', () => {
         await saveAppData({ todos: todos.value, categories: categories.value });
       }
 
-      await refreshVisibleTodos();
+      if (!searchQuery.value.trim()) {
+        refreshVisibleTodosSync();
+      } else {
+        await refreshVisibleTodos();
+      }
     } catch (err) {
-      storageError.value = String(err);
       // 降级为默认数据
       const defaultData = createDefaultAppData();
       todos.value = defaultData.todos;
       categories.value = defaultData.categories;
-      visibleTodos.value = defaultData.todos;
+      refreshVisibleTodosSync();
+
+      try {
+        await saveAppData(defaultData);
+        storageError.value = null;
+        refreshVisibleTodosSync();
+      } catch (persistErr) {
+        storageError.value = `${String(err)}；默认数据回写失败：${String(persistErr)}`;
+      }
     } finally {
       isLoading.value = false;
     }
@@ -280,24 +415,50 @@ export const useTodoStore = defineStore('todo', () => {
 
   // ─── 变更操作 ─────────────────────────────────────
 
-  async function toggleTodo(id: number) {
-    const target = todos.value.find((item) => item.id === id);
-    if (!target) return;
+  const mutationStrategies = createTodoMutationStrategies({
+    getTodos: () => todos.value,
+    setTodos: (next) => {
+      todos.value = next;
+    },
+    getCategories: () => categories.value,
+    setCategories: (next) => {
+      categories.value = next;
+    },
+    getSelectedCategoryId: () => selectedCategoryId.value,
+    setSelectedCategoryId: (next) => {
+      selectedCategoryId.value = next;
+    },
+    normalizeTodo,
+    persistData,
+  });
 
-    if (currentSettings.value.storageType === 'sqlite') {
-      try {
-        const updated = normalizeTodo(await toggleSqliteTodo(id));
-        Object.assign(target, updated);
-      } catch (err) {
-        storageError.value = String(err);
-      }
-      return;
+  const currentMutationStrategy = computed<TodoMutationStrategy>(() => {
+    return currentSettings.value.storageType === 'sqlite'
+      ? mutationStrategies.sqlite
+      : mutationStrategies.json;
+  });
+
+  async function runMutation(operation: (strategy: TodoMutationStrategy) => Promise<void>) {
+    try {
+      await operation(currentMutationStrategy.value);
+    } catch (err) {
+      storageError.value = String(err);
     }
+  }
 
-    const nextCompleted = !target.completed;
-    target.completed = nextCompleted;
-    target.completedAt = nextCompleted ? new Date().toISOString() : undefined;
-    persistData();
+  async function runMutationWithResult<T>(
+    operation: (strategy: TodoMutationStrategy) => Promise<T>
+  ): Promise<T | undefined> {
+    try {
+      return await operation(currentMutationStrategy.value);
+    } catch (err) {
+      storageError.value = String(err);
+      return undefined;
+    }
+  }
+
+  async function toggleTodo(id: number) {
+    await runMutation((strategy) => strategy.toggleTodo(id));
   }
 
   async function addTodo(
@@ -306,38 +467,7 @@ export const useTodoStore = defineStore('todo', () => {
     categoryId: string,
     description?: string
   ) {
-    const nowIso = new Date().toISOString();
-
-    if (currentSettings.value.storageType === 'sqlite') {
-      const input: CreateTodoInput = {
-        title,
-        priority,
-        categoryId,
-        description,
-        createdAt: nowIso,
-      };
-      try {
-        const created = normalizeTodo(await addSqliteTodo(input));
-        todos.value.unshift(created);
-      } catch (err) {
-        storageError.value = String(err);
-      }
-      return;
-    }
-
-    const newId =
-      todos.value.length > 0 ? Math.max(...todos.value.map((t) => t.id)) + 1 : 1;
-
-    todos.value.unshift({
-      id: newId,
-      title,
-      completed: false,
-      priority,
-      createdAt: nowIso,
-      categoryId,
-      description,
-    });
-    persistData();
+    await runMutation((strategy) => strategy.addTodo(title, priority, categoryId, description));
   }
 
   async function updateTodo(
@@ -347,195 +477,60 @@ export const useTodoStore = defineStore('todo', () => {
     categoryId: string,
     description?: string
   ) {
-    const target = todos.value.find((item) => item.id === id);
-    if (!target) return;
-
-    if (currentSettings.value.storageType === 'sqlite') {
-      const updatePayload: TodoItem = normalizeTodo({
-        ...target,
-        title,
-        priority,
-        categoryId,
-        description,
-      });
-
-      try {
-        const updated = normalizeTodo(await updateSqliteTodo(updatePayload));
-        Object.assign(target, updated);
-      } catch (err) {
-        storageError.value = String(err);
-      }
-      return;
-    }
-
-    target.title = title;
-    target.priority = priority;
-    target.categoryId = categoryId;
-    target.description = description;
-    persistData();
+    await runMutation((strategy) => strategy.updateTodo(id, title, priority, categoryId, description));
   }
 
   async function addCategory(name: string, color: string, icon: string) {
-    const newId = 'cat-' + Date.now();
-    const newCategory: CategoryItem = { id: newId, name, color, icon };
-
-    if (currentSettings.value.storageType === 'sqlite') {
-      try {
-        await addSqliteCategory(newCategory);
-        categories.value.push(newCategory);
-      } catch (err) {
-        storageError.value = String(err);
-      }
-      return newId;
-    }
-
-    categories.value.push(newCategory);
-    persistData();
-    return newId;
+    return runMutationWithResult((strategy) => strategy.addCategory(name, color, icon));
   }
 
   async function updateCategory(id: string, name: string, color: string, icon: string) {
-    const target = categories.value.find((category) => category.id === id);
-    if (!target) return;
-
-    if (currentSettings.value.storageType === 'sqlite') {
-      const updatePayload: CategoryItem = {
-        id,
-        name,
-        color,
-        icon,
-      };
-      try {
-        await updateSqliteCategory(updatePayload);
-        Object.assign(target, updatePayload);
-      } catch (err) {
-        storageError.value = String(err);
-      }
-      return;
-    }
-
-    target.name = name;
-    target.color = color;
-    target.icon = icon;
-    persistData();
+    await runMutation((strategy) => strategy.updateCategory(id, name, color, icon));
   }
 
   async function deleteCategory(id: string) {
-    if (currentSettings.value.storageType === 'sqlite') {
-      try {
-        await deleteSqliteCategory(id);
-      } catch (err) {
-        storageError.value = String(err);
-        return;
-      }
-    }
-
-    todos.value = todos.value.filter((t) => t.categoryId !== id);
-    categories.value = categories.value.filter((c) => c.id !== id);
-    if (selectedCategoryId.value === id) {
-      selectedCategoryId.value = null;
-    }
-
-    if (currentSettings.value.storageType !== 'sqlite') {
-      persistData();
-    }
+    await runMutation((strategy) => strategy.deleteCategory(id));
   }
 
   async function moveToTrash(id: number) {
-    const target = todos.value.find((item) => item.id === id);
-    if (!target) return;
-
-    if (currentSettings.value.storageType === 'sqlite') {
-      const updatePayload: TodoItem = normalizeTodo({
-        ...target,
-        isDeleted: true,
-        deletedAt: new Date().toISOString(),
-      });
-      try {
-        const updated = normalizeTodo(await updateSqliteTodo(updatePayload));
-        Object.assign(target, updated);
-      } catch (err) {
-        storageError.value = String(err);
-      }
-      return;
-    }
-
-    target.isDeleted = true;
-    target.deletedAt = new Date().toISOString();
-    persistData();
+    await runMutation((strategy) => strategy.moveToTrash(id));
   }
 
   async function restoreTodo(id: number) {
-    const target = todos.value.find((item) => item.id === id);
-    if (!target) return;
-
-    if (currentSettings.value.storageType === 'sqlite') {
-      const updatePayload: TodoItem = normalizeTodo({
-        ...target,
-        isDeleted: false,
-        deletedAt: undefined,
-      });
-      try {
-        const updated = normalizeTodo(await updateSqliteTodo(updatePayload));
-        Object.assign(target, updated);
-      } catch (err) {
-        storageError.value = String(err);
-      }
-      return;
-    }
-
-    target.isDeleted = false;
-    target.deletedAt = undefined;
-    persistData();
+    await runMutation((strategy) => strategy.restoreTodo(id));
   }
 
   async function permanentlyDeleteTodo(id: number) {
-    const normalizedId = Number(id);
-    if (Number.isNaN(normalizedId)) return;
-
-    if (currentSettings.value.storageType === 'sqlite') {
-      try {
-        await deleteSqliteTodo(normalizedId);
-      } catch (err) {
-        storageError.value = String(err);
-        return;
-      }
-    }
-
-    const index = todos.value.findIndex((item) => Number(item.id) === normalizedId);
-    if (index !== -1) {
-      todos.value.splice(index, 1);
-      if (currentSettings.value.storageType !== 'sqlite') {
-        persistData();
-      }
-    }
+    await runMutation((strategy) => strategy.permanentlyDeleteTodo(id));
   }
 
   async function clearTrash() {
-    if (currentSettings.value.storageType === 'sqlite') {
-      const trashIds = todos.value
-        .filter((item) => item.isDeleted)
-        .map((item) => item.id);
-      try {
-        for (const id of trashIds) {
-          await deleteSqliteTodo(id);
-        }
-        todos.value = todos.value.filter((item) => !item.isDeleted);
-      } catch (err) {
-        storageError.value = String(err);
-      }
-      return;
-    }
-
-    todos.value = todos.value.filter((item) => !item.isDeleted);
-    persistData();
+    await runMutation((strategy) => strategy.clearTrash());
   }
 
   // ─── 设置更新 ─────────────────────────────────────
 
-  async function updateSettings(newType: 'json' | 'sqlite', newDataDir?: string) {
-    const effectiveDir = newDataDir?.trim() || undefined;
-    const newSettings: AppSettings = { storageType: newType, dataDir: effectiveDir };
+  function normalizeOptionalText(value?: string): string | undefined {
+    const trimmed = value?.trim();
+    return trimmed ? trimmed : undefined;
+  }
+
+  async function updateSettings(
+    newType: 'json' | 'sqlite',
+    newDataDir?: string,
+    aiConfig?: {
+      aiModel?: string;
+      aiBaseUrl?: string;
+      aiApiKey?: string;
+    },
+  ) {
+    const newSettings: AppSettings = {
+      storageType: newType,
+      dataDir: normalizeOptionalText(newDataDir),
+      aiModel: normalizeOptionalText(aiConfig?.aiModel),
+      aiBaseUrl: normalizeOptionalText(aiConfig?.aiBaseUrl),
+      aiApiKey: normalizeOptionalText(aiConfig?.aiApiKey),
+    };
     try {
       await saveSettings(newSettings, { todos: todos.value, categories: categories.value });
       currentSettings.value = newSettings;

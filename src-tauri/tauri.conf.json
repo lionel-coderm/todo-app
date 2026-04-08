@@ -13,6 +13,7 @@
     "windows": [
       {
         "title": "Todo Studio",
+        "visible": false,
         "width": 1280,
         "height": 1020,
         "minWidth": 980,

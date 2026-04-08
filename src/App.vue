@@ -1,19 +1,31 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
+import { computed, defineAsyncComponent, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 import { storeToRefs } from 'pinia';
 import { type TodoItem as TodoItemModel, TaskPriority } from '@/data/todos';
-import type { SearchFilter } from '@/services/storageService';
-import { getDefaultDataDir } from '@/services/storageService';
+import type { ReportPeriod, SearchFilter } from '@/services/storageService';
+import { generateAiReport, getDefaultDataDir, showMainWindow } from '@/services/storageService';
 import { useTodoStore } from '@/stores/todo';
 import Sidebar from '@/components/Sidebar.vue';
 import HeaderBar from '@/components/HeaderBar.vue';
 import TodoItem from '@/components/TodoItem.vue';
 import TaskTimeline from '@/components/TaskTimeline.vue';
-import TaskModal from '@/components/TaskModal.vue';
-import CategoryModal from '@/components/CategoryModal.vue';
-import DeleteCategoryConfirm from '@/components/DeleteCategoryConfirm.vue';
-import TaskDetailModal from '@/components/TaskDetailModal.vue';
-import SettingsModal from '@/components/SettingsModal.vue';
+
+async function loadModalComponent<T>(loader: () => Promise<T>) {
+  await import('@/modals.css');
+  return loader();
+}
+
+const TaskModal = defineAsyncComponent(() => loadModalComponent(() => import('@/components/TaskModal.vue')));
+const CategoryModal = defineAsyncComponent(() => loadModalComponent(() => import('@/components/CategoryModal.vue')));
+const DeleteCategoryConfirm = defineAsyncComponent(
+  () => loadModalComponent(() => import('@/components/DeleteCategoryConfirm.vue')),
+);
+const TaskDetailModal = defineAsyncComponent(
+  () => loadModalComponent(() => import('@/components/TaskDetailModal.vue')),
+);
+const SettingsModal = defineAsyncComponent(
+  () => loadModalComponent(() => import('@/components/SettingsModal.vue')),
+);
 
 const todoStore = useTodoStore();
 const {
@@ -38,7 +50,10 @@ const {
 } = todoStore;
 
 onMounted(() => {
-  todoStore.initialize();
+  void todoStore.initialize();
+  void nextTick()
+    .then(() => showMainWindow())
+    .catch(() => undefined);
 });
 
 const filterTitleMap: Record<SearchFilter, string> = {
@@ -251,6 +266,10 @@ const isSavingSettings = ref(false);
 const settingsSaveError = ref<string | null>(null);
 const settingsSaveSuccess = ref(false);
 const defaultDataDirPlaceholder = ref('加载中...');
+const isGeneratingReport = ref(false);
+const reportError = ref<string | null>(null);
+const reportContent = ref('');
+const reportPeriod = ref<ReportPeriod>('weekly');
 
 const settingsForm = ref({
   theme: 'light',
@@ -264,8 +283,12 @@ const settingsForm = ref({
 async function openSettingsModal() {
   settingsForm.value.dataFormat = currentSettings.value.storageType;
   settingsForm.value.dataLocation = currentSettings.value.dataDir ?? '';
+  settingsForm.value.aiModel = currentSettings.value.aiModel ?? '';
+  settingsForm.value.aiBaseUrl = currentSettings.value.aiBaseUrl ?? '';
+  settingsForm.value.aiApiKey = currentSettings.value.aiApiKey ?? '';
   settingsSaveError.value = null;
   settingsSaveSuccess.value = false;
+  reportError.value = null;
   try {
     defaultDataDirPlaceholder.value = await getDefaultDataDir();
   } catch {
@@ -285,7 +308,11 @@ async function handleSaveSettings() {
   isSavingSettings.value = true;
 
   try {
-    await updateSettings(settingsForm.value.dataFormat, settingsForm.value.dataLocation);
+    await updateSettings(settingsForm.value.dataFormat, settingsForm.value.dataLocation, {
+      aiModel: settingsForm.value.aiModel,
+      aiBaseUrl: settingsForm.value.aiBaseUrl,
+      aiApiKey: settingsForm.value.aiApiKey,
+    });
     settingsSaveSuccess.value = true;
     setTimeout(() => {
       settingsSaveSuccess.value = false;
@@ -294,6 +321,21 @@ async function handleSaveSettings() {
     settingsSaveError.value = String(err);
   } finally {
     isSavingSettings.value = false;
+  }
+}
+
+async function handleGenerateReport(period: ReportPeriod) {
+  if (isGeneratingReport.value) return;
+  reportError.value = null;
+  reportPeriod.value = period;
+  isGeneratingReport.value = true;
+  try {
+    const generated = await generateAiReport(period);
+    reportContent.value = generated;
+  } catch (err) {
+    reportError.value = String(err);
+  } finally {
+    isGeneratingReport.value = false;
   }
 }
 
@@ -350,7 +392,7 @@ function handleSelectCategory(id: string | null) {
       <div class="layout-content">
         <div class="content-wrapper">
           <div class="main-list-column">
-            <TransitionGroup name="fade-up" tag="ul" class="todo-list">
+            <ul class="todo-list">
               <TodoItem
                 v-for="todo in visibleTodos"
                 :key="todo.id"
@@ -373,7 +415,7 @@ function handleSelectCategory(id: string | null) {
                 </svg>
                 <p>没有找到相关任务内容...</p>
               </li>
-            </TransitionGroup>
+            </ul>
           </div>
 
           <aside class="timeline-column">
@@ -385,6 +427,7 @@ function handleSelectCategory(id: string | null) {
 
     <Teleport to="body">
       <TaskModal
+        v-if="isTaskModalOpen"
         :visible="isTaskModalOpen"
         :editing-task-id="editingTaskId"
         :categories="categories"
@@ -402,6 +445,7 @@ function handleSelectCategory(id: string | null) {
       />
 
       <CategoryModal
+        v-if="isCategoryModalOpen"
         :visible="isCategoryModalOpen"
         :categories="categories"
         :editing-category-id="editingCategoryId"
@@ -421,6 +465,7 @@ function handleSelectCategory(id: string | null) {
       />
 
       <DeleteCategoryConfirm
+        v-if="isDeleteCategoryConfirmOpen"
         :visible="isDeleteCategoryConfirmOpen"
         :category-name="pendingDeleteCategoryName"
         :task-count="pendingDeleteCategoryTaskCount"
@@ -429,6 +474,7 @@ function handleSelectCategory(id: string | null) {
       />
 
       <TaskDetailModal
+        v-if="viewTaskData"
         :visible="!!viewTaskData"
         :task="viewTaskData"
         :categories="categories"
@@ -438,6 +484,7 @@ function handleSelectCategory(id: string | null) {
       />
 
       <SettingsModal
+        v-if="isSettingsModalOpen"
         :visible="isSettingsModalOpen"
         :theme="settingsForm.theme"
         :data-location="settingsForm.dataLocation"
@@ -449,8 +496,13 @@ function handleSelectCategory(id: string | null) {
         :is-saving="isSavingSettings"
         :error="settingsSaveError"
         :success="settingsSaveSuccess"
+        :is-generating-report="isGeneratingReport"
+        :report-content="reportContent"
+        :report-period="reportPeriod"
+        :report-error="reportError"
         @close="closeSettingsModal"
         @save="handleSaveSettings"
+        @generate-report="handleGenerateReport"
         @update:theme="settingsForm.theme = $event"
         @update:data-location="settingsForm.dataLocation = $event"
         @update:data-format="settingsForm.dataFormat = $event"
@@ -458,6 +510,7 @@ function handleSelectCategory(id: string | null) {
         @update:ai-base-url="settingsForm.aiBaseUrl = $event"
         @update:ai-api-key="settingsForm.aiApiKey = $event"
       />
+
     </Teleport>
   </div>
 </template>
