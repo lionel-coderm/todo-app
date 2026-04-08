@@ -13,12 +13,21 @@ export interface AppSettings {
   dataDir?: string; // 自定义数据目录，undefined 或空字符串 = 系统默认
 }
 
-export type SearchFilter = 'all' | 'active' | 'completed';
+export type SearchFilter = 'all' | 'active' | 'completed' | 'trash';
 
 export interface SearchTodosParams {
   query: string;
   filter: SearchFilter;
   selectedCategoryId?: string | null;
+  sortOrder?: 'created' | 'priority';
+}
+
+export interface CreateTodoInput {
+  title: string;
+  priority: TodoItem['priority'];
+  categoryId: string;
+  description?: string;
+  createdAt?: string;
 }
 
 // ─── 存储服务 ──────────────────────────────────────────
@@ -59,7 +68,36 @@ export async function searchSqliteTodos(params: SearchTodosParams): Promise<Todo
     query: params.query,
     filter: params.filter,
     selectedCategoryId: params.selectedCategoryId ?? null,
+    sortOrder: params.sortOrder ?? 'created',
   });
+}
+
+export async function addSqliteTodo(input: CreateTodoInput): Promise<TodoItem> {
+  return invoke<TodoItem>('add_todo', { input });
+}
+
+export async function updateSqliteTodo(todo: TodoItem): Promise<TodoItem> {
+  return invoke<TodoItem>('update_todo', { todo });
+}
+
+export async function toggleSqliteTodo(id: number): Promise<TodoItem> {
+  return invoke<TodoItem>('toggle_todo', { id });
+}
+
+export async function deleteSqliteTodo(id: number): Promise<void> {
+  return invoke('delete_todo', { id });
+}
+
+export async function addSqliteCategory(category: CategoryItem): Promise<void> {
+  return invoke('add_category', { category });
+}
+
+export async function updateSqliteCategory(category: CategoryItem): Promise<void> {
+  return invoke('update_category', { category });
+}
+
+export async function deleteSqliteCategory(id: string): Promise<void> {
+  return invoke('delete_category', { id });
 }
 
 /**

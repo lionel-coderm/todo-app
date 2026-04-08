@@ -1,29 +1,35 @@
 <script setup lang="ts">
-import type { TodoItem } from '@/data/todos';
+import { getPriorityMeta, type TodoItem } from '@/data/todos';
 import { useTodoStore } from '@/stores/todo';
+import { formatDateMonthDay, formatDateYmd } from '@/utils/dateFormat';
 import { computed } from 'vue';
 
 const props = defineProps<{
   todo: TodoItem;
+  isTrashView?: boolean;
 }>();
 
 const emit = defineEmits<{
   toggle: [id: number];
   edit: [todo: TodoItem];
   view: [todo: TodoItem];
+  delete: [id: number];
+  restore: [id: number];
+  'permanent-delete': [id: number];
 }>();
 
 const todoStore = useTodoStore();
 const category = computed(() => todoStore.categories.find(c => c.id === props.todo.categoryId));
-const createdAtLabel = computed(() => formatDisplayDate(props.todo.createdAt));
-const completedAtLabel = computed(() => formatDisplayDate(props.todo.completedAt));
-
-function formatDisplayDate(dateString?: string) {
-  if (!dateString) return '—';
-  const date = new Date(dateString);
-  if (Number.isNaN(date.getTime())) return '—';
-  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
-}
+const createdAtLabel = computed(() => formatDateYmd(props.todo.createdAt));
+const createdAtShortLabel = computed(() => formatDateMonthDay(props.todo.createdAt));
+const completedAtLabel = computed(() => formatDateYmd(props.todo.completedAt));
+const priorityMeta = computed(() => getPriorityMeta(props.todo.priority));
+const priorityLabel = computed(() => priorityMeta.value.label);
+const priorityKey = computed(() => priorityMeta.value.key);
+const priorityStyle = computed(() => ({
+  backgroundColor: priorityMeta.value.bgColor,
+  color: priorityMeta.value.color,
+}));
 </script>
 
 <template>
@@ -37,9 +43,24 @@ function formatDisplayDate(dateString?: string) {
     <div class="content">
       <div class="title-row">
         <h3 class="title">{{ todo.title }}</h3>
-        <button class="edit-btn" type="button" @click.stop="emit('edit', todo)">
-          编辑
-        </button>
+        <div class="action-buttons">
+          <template v-if="!isTrashView">
+            <button class="edit-btn" type="button" @click.stop="emit('edit', todo)">
+              编辑
+            </button>
+            <button class="delete-btn" type="button" @click.stop="emit('delete', todo.id)">
+              删除
+            </button>
+          </template>
+          <template v-else>
+            <button class="restore-btn" type="button" @click.stop="emit('restore', todo.id)">
+              恢复
+            </button>
+            <button class="permanent-delete-btn" type="button" @click.stop="emit('permanent-delete', todo.id)">
+              彻底删除
+            </button>
+          </template>
+        </div>
       </div>
       <p v-if="todo.description" class="description">{{ todo.description }}</p>
       <div class="meta">
@@ -47,12 +68,12 @@ function formatDisplayDate(dateString?: string) {
           {{ category.icon }} {{ category.name }}
         </span>
         <span class="pill pill-category" v-else>未分类</span>
-        <span class="pill pill-priority" :data-priority="todo.priority || 'low'">
-          {{ todo.priority === 'high' ? '高' : todo.priority === 'medium' ? '中' : '低' }}
+        <span class="pill pill-priority" :data-priority="priorityKey" :style="priorityStyle">
+          {{ priorityLabel }}
         </span>
         <span class="date">创建：{{ createdAtLabel }}</span>
         <span v-if="todo.completedAt" class="date date-success">完成：{{ completedAtLabel }}</span>
-        <span class="date">{{ todo.dueLabel }}</span>
+        <span class="date">{{ createdAtShortLabel }}</span>
       </div>
     </div>
   </li>
@@ -150,6 +171,11 @@ function formatDisplayDate(dateString?: string) {
   flex: 1;
 }
 
+.action-buttons {
+  display: flex;
+  gap: 8px;
+}
+
 .edit-btn {
   border: none;
   background: rgba(10, 132, 255, 0.1);
@@ -163,6 +189,51 @@ function formatDisplayDate(dateString?: string) {
 }
 .edit-btn:hover {
   background: rgba(10, 132, 255, 0.16);
+}
+
+.delete-btn {
+  border: none;
+  background: rgba(255, 59, 48, 0.1);
+  color: var(--c-danger);
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: var(--transition-fast);
+}
+.delete-btn:hover {
+  background: rgba(255, 59, 48, 0.16);
+}
+
+.restore-btn {
+  border: none;
+  background: rgba(52, 199, 89, 0.1);
+  color: var(--c-success);
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: var(--transition-fast);
+}
+.restore-btn:hover {
+  background: rgba(52, 199, 89, 0.16);
+}
+
+.permanent-delete-btn {
+  border: none;
+  background: rgba(255, 59, 48, 0.15);
+  color: #d32f2f;
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: var(--transition-fast);
+}
+.permanent-delete-btn:hover {
+  background: rgba(255, 59, 48, 0.22);
 }
 
 .description {
@@ -193,19 +264,6 @@ function formatDisplayDate(dateString?: string) {
 .pill-category {
   background-color: var(--c-bg-sidebar-hover);
   color: var(--c-text-secondary);
-}
-
-.pill-priority[data-priority="high"] {
-  background-color: rgba(255, 59, 48, 0.1);
-  color: var(--c-danger);
-}
-.pill-priority[data-priority="medium"] {
-  background-color: rgba(255, 149, 0, 0.1);
-  color: var(--c-warning);
-}
-.pill-priority[data-priority="low"] {
-  background-color: rgba(52, 199, 89, 0.1);
-  color: var(--c-success);
 }
 
 .date {

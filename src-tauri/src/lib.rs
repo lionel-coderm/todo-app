@@ -1,7 +1,7 @@
 mod models;
 mod storage;
 
-use models::{AppData, AppSettings, SearchTodosQuery, TodoItem};
+use models::{AppData, AppSettings, CategoryItem, CreateTodoInput, SearchTodosQuery, TodoItem};
 use storage::{json_storage::JsonStorage, sqlite_storage::SqliteStorage, StorageBackend};
 
 use std::fs;
@@ -40,8 +40,7 @@ fn read_settings(system_dir: &PathBuf) -> AppSettings {
 /// 展开 ~ 为真实 home 目录
 fn expand_tilde(path: &str) -> Result<PathBuf, String> {
     if path.starts_with("~/") || path == "~" {
-        let home = std::env::var("HOME")
-            .map_err(|_| "无法获取 HOME 目录环境变量".to_string())?;
+        let home = std::env::var("HOME").map_err(|_| "无法获取 HOME 目录环境变量".to_string())?;
         Ok(PathBuf::from(home).join(path.trim_start_matches("~/")))
     } else {
         Ok(PathBuf::from(path))
@@ -54,8 +53,7 @@ fn effective_data_dir(app: &tauri::AppHandle, settings: &AppSettings) -> Result<
         let trimmed = custom.trim();
         if !trimmed.is_empty() {
             let expanded = expand_tilde(trimmed)?;
-            fs::create_dir_all(&expanded)
-                .map_err(|e| format!("创建自定义数据目录失败: {e}"))?;
+            fs::create_dir_all(&expanded).map_err(|e| format!("创建自定义数据目录失败: {e}"))?;
             return Ok(expanded);
         }
     }
@@ -76,7 +74,7 @@ fn sqlite_backend_for_current_settings(app: &tauri::AppHandle) -> Result<SqliteS
     let settings = read_settings(&system_dir);
 
     if settings.storage_type != "sqlite" {
-        return Err("当前不是 SQLite 存储模式，无法使用 SQLite 搜索".to_string());
+        return Err("当前不是 SQLite 存储模式，无法使用 SQLite 命令".to_string());
     }
 
     let data_dir = effective_data_dir(app, &settings)?;
@@ -107,13 +105,62 @@ fn save_app_data(app: tauri::AppHandle, data: AppData) -> Result<(), String> {
 
 /// 在 SQLite 模式下执行任务搜索
 #[tauri::command]
-fn search_todos(app: tauri::AppHandle, query: String, filter: String, selected_category_id: Option<String>) -> Result<Vec<TodoItem>, String> {
+fn search_todos(
+    app: tauri::AppHandle,
+    query: String,
+    filter: String,
+    selected_category_id: Option<String>,
+    sort_order: Option<String>,
+) -> Result<Vec<TodoItem>, String> {
     let backend = sqlite_backend_for_current_settings(&app)?;
     backend.search(SearchTodosQuery {
         query,
         filter,
         selected_category_id,
+        sort_order,
     })
+}
+
+#[tauri::command]
+fn add_todo(app: tauri::AppHandle, input: CreateTodoInput) -> Result<TodoItem, String> {
+    let backend = sqlite_backend_for_current_settings(&app)?;
+    backend.add_todo(input)
+}
+
+#[tauri::command]
+fn update_todo(app: tauri::AppHandle, todo: TodoItem) -> Result<TodoItem, String> {
+    let backend = sqlite_backend_for_current_settings(&app)?;
+    backend.update_todo(&todo)
+}
+
+#[tauri::command]
+fn toggle_todo(app: tauri::AppHandle, id: i64) -> Result<TodoItem, String> {
+    let backend = sqlite_backend_for_current_settings(&app)?;
+    backend.toggle_todo(id)
+}
+
+#[tauri::command]
+fn delete_todo(app: tauri::AppHandle, id: i64) -> Result<(), String> {
+    let backend = sqlite_backend_for_current_settings(&app)?;
+    backend.delete_todo(id)
+}
+
+#[tauri::command]
+fn add_category(app: tauri::AppHandle, category: CategoryItem) -> Result<(), String> {
+    let backend = sqlite_backend_for_current_settings(&app)?;
+    backend.add_category(&category)
+}
+
+#[tauri::command]
+fn update_category(app: tauri::AppHandle, category: CategoryItem) -> Result<(), String> {
+    let backend = sqlite_backend_for_current_settings(&app)?;
+    backend.update_category(&category)
+}
+
+#[tauri::command]
+fn delete_category(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    let backend = sqlite_backend_for_current_settings(&app)?;
+    backend.delete_category(&id)
 }
 
 /// 读取应用设置
@@ -145,8 +192,8 @@ fn save_settings(
 
     // 将新设置写入系统目录
     let path = settings_path(&system_dir);
-    let content = serde_json::to_string_pretty(&settings)
-        .map_err(|e| format!("序列化设置失败: {e}"))?;
+    let content =
+        serde_json::to_string_pretty(&settings).map_err(|e| format!("序列化设置失败: {e}"))?;
     fs::write(&path, content).map_err(|e| format!("写入设置失败: {e}"))?;
 
     Ok(())
@@ -169,6 +216,13 @@ pub fn run() {
             load_app_data,
             save_app_data,
             search_todos,
+            add_todo,
+            update_todo,
+            toggle_todo,
+            delete_todo,
+            add_category,
+            update_category,
+            delete_category,
             load_settings,
             save_settings,
             get_default_data_dir,

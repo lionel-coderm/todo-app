@@ -10,6 +10,7 @@ export interface SearchTodosParams {
   query: string;
   filter: SearchFilter;
   selectedCategoryId: string | null;
+  sortOrder?: 'created' | 'priority';
 }
 
 interface SearchableTodo {
@@ -36,10 +37,20 @@ function applyFilters(
 ) {
   let result = todos;
 
-  if (filter === 'active') {
-    result = result.filter((item) => !item.completed);
-  } else if (filter === 'completed') {
-    result = result.filter((item) => item.completed);
+  // 先处理回收站过滤
+  if (filter === 'trash') {
+    result = result.filter((item) => item.isDeleted === true);
+  } else {
+    result = result.filter((item) => item.isDeleted !== true);
+  }
+
+  // 再处理完成状态过滤（回收站视图不区分完成状态）
+  if (filter !== 'trash') {
+    if (filter === 'active') {
+      result = result.filter((item) => !item.completed);
+    } else if (filter === 'completed') {
+      result = result.filter((item) => item.completed);
+    }
   }
 
   if (selectedCategoryId) {
@@ -81,6 +92,7 @@ export async function searchTodos(params: SearchTodosParams): Promise<TodoItem[]
       query: params.query,
       filter: params.filter,
       selectedCategoryId: params.selectedCategoryId,
+      sortOrder: params.sortOrder,
     });
   }
 

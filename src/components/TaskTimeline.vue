@@ -2,6 +2,7 @@
 import { computed } from 'vue';
 import { storeToRefs } from 'pinia';
 import { useTodoStore } from '@/stores/todo';
+import { formatDateMonthDay } from '@/utils/dateFormat';
 
 const todoStore = useTodoStore();
 const { visibleTodos } = storeToRefs(todoStore);
@@ -10,7 +11,7 @@ const timelineDates = computed(() => {
   return visibleTodos.value.map(todo => {
     return {
       id: todo.id,
-      label: todo.dueLabel || '无日期',
+      label: formatDateMonthDay(todo.createdAt, '无日期'),
       completed: todo.completed
     };
   });
