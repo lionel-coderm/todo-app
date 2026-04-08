@@ -1,0 +1,178 @@
+mod models;
+mod storage;
+
+use models::{AppData, AppSettings, SearchTodosQuery, TodoItem};
+use storage::{json_storage::JsonStorage, sqlite_storage::SqliteStorage, StorageBackend};
+
+use std::fs;
+use std::path::PathBuf;
+use tauri::Manager;
+
+// ─── 辅助函数 ──────────────────────────────────────────
+
+/// 获取系统默认应用数据目录（用于存放 settings.json）
+fn get_system_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("获取系统数据目录失败: {e}"))?;
+    fs::create_dir_all(&dir).map_err(|e| format!("创建系统数据目录失败: {e}"))?;
+    Ok(dir)
+}
+
+/// 设置文件路径（永远在系统目录）
+fn settings_path(system_dir: &PathBuf) -> PathBuf {
+    system_dir.join("settings.json")
+}
+
+/// 读取当前设置
+fn read_settings(system_dir: &PathBuf) -> AppSettings {
+    let path = settings_path(system_dir);
+    if !path.exists() {
+        return AppSettings::default();
+    }
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// 展开 ~ 为真实 home 目录
+fn expand_tilde(path: &str) -> Result<PathBuf, String> {
+    if path.starts_with("~/") || path == "~" {
+        let home = std::env::var("HOME")
+            .map_err(|_| "无法获取 HOME 目录环境变量".to_string())?;
+        Ok(PathBuf::from(home).join(path.trim_start_matches("~/")))
+    } else {
+        Ok(PathBuf::from(path))
+    }
+}
+
+/// 根据设置获取实际的数据目录（自定义 or 系统默认）
+fn effective_data_dir(app: &tauri::AppHandle, settings: &AppSettings) -> Result<PathBuf, String> {
+    if let Some(custom) = &settings.data_dir {
+        let trimmed = custom.trim();
+        if !trimmed.is_empty() {
+            let expanded = expand_tilde(trimmed)?;
+            fs::create_dir_all(&expanded)
+                .map_err(|e| format!("创建自定义数据目录失败: {e}"))?;
+            return Ok(expanded);
+        }
+    }
+    // 无自定义路径，回退到系统默认目录
+    get_system_dir(app)
+}
+
+/// 根据存储类型创建后端实例
+fn make_backend(storage_type: &str, data_dir: PathBuf) -> Box<dyn StorageBackend> {
+    match storage_type {
+        "sqlite" => Box::new(SqliteStorage::new(data_dir)),
+        _ => Box::new(JsonStorage::new(data_dir)),
+    }
+}
+
+fn sqlite_backend_for_current_settings(app: &tauri::AppHandle) -> Result<SqliteStorage, String> {
+    let system_dir = get_system_dir(app)?;
+    let settings = read_settings(&system_dir);
+
+    if settings.storage_type != "sqlite" {
+        return Err("当前不是 SQLite 存储模式，无法使用 SQLite 搜索".to_string());
+    }
+
+    let data_dir = effective_data_dir(app, &settings)?;
+    Ok(SqliteStorage::new(data_dir))
+}
+
+// ─── Tauri 命令 ────────────────────────────────────────
+
+/// 读取 todos + categories
+#[tauri::command]
+fn load_app_data(app: tauri::AppHandle) -> Result<AppData, String> {
+    let system_dir = get_system_dir(&app)?;
+    let settings = read_settings(&system_dir);
+    let data_dir = effective_data_dir(&app, &settings)?;
+    let backend = make_backend(&settings.storage_type, data_dir);
+    backend.load()
+}
+
+/// 保存 todos + categories
+#[tauri::command]
+fn save_app_data(app: tauri::AppHandle, data: AppData) -> Result<(), String> {
+    let system_dir = get_system_dir(&app)?;
+    let settings = read_settings(&system_dir);
+    let data_dir = effective_data_dir(&app, &settings)?;
+    let backend = make_backend(&settings.storage_type, data_dir);
+    backend.save(&data)
+}
+
+/// 在 SQLite 模式下执行任务搜索
+#[tauri::command]
+fn search_todos(app: tauri::AppHandle, query: String, filter: String, selected_category_id: Option<String>) -> Result<Vec<TodoItem>, String> {
+    let backend = sqlite_backend_for_current_settings(&app)?;
+    backend.search(SearchTodosQuery {
+        query,
+        filter,
+        selected_category_id,
+    })
+}
+
+/// 读取应用设置
+#[tauri::command]
+fn load_settings(app: tauri::AppHandle) -> Result<AppSettings, String> {
+    let system_dir = get_system_dir(&app)?;
+    Ok(read_settings(&system_dir))
+}
+
+/// 保存应用设置（存储类型或数据目录变化时，自动将数据迁移到新位置）
+#[tauri::command]
+fn save_settings(
+    app: tauri::AppHandle,
+    settings: AppSettings,
+    data: AppData,
+) -> Result<(), String> {
+    let system_dir = get_system_dir(&app)?;
+    let old_settings = read_settings(&system_dir);
+
+    let type_changed = old_settings.storage_type != settings.storage_type;
+    let dir_changed = old_settings.data_dir != settings.data_dir;
+
+    // 只要类型或目录有变化，就把数据写入新位置
+    if type_changed || dir_changed {
+        let new_data_dir = effective_data_dir(&app, &settings)?;
+        let new_backend = make_backend(&settings.storage_type, new_data_dir);
+        new_backend.save(&data)?;
+    }
+
+    // 将新设置写入系统目录
+    let path = settings_path(&system_dir);
+    let content = serde_json::to_string_pretty(&settings)
+        .map_err(|e| format!("序列化设置失败: {e}"))?;
+    fs::write(&path, content).map_err(|e| format!("写入设置失败: {e}"))?;
+
+    Ok(())
+}
+
+/// 返回系统默认数据目录路径（供前端展示占位符）
+#[tauri::command]
+fn get_default_data_dir(app: tauri::AppHandle) -> Result<String, String> {
+    let dir = get_system_dir(&app)?;
+    Ok(dir.display().to_string())
+}
+
+// ─── 入口点 ────────────────────────────────────────────
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .invoke_handler(tauri::generate_handler![
+            load_app_data,
+            save_app_data,
+            search_todos,
+            load_settings,
+            save_settings,
+            get_default_data_dir,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
