@@ -2,6 +2,16 @@ name: Build macOS Universal Installer
 
 on:
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "Publish installer to GitHub Release"
+        type: boolean
+        required: false
+        default: false
+      release_tag:
+        description: "Release tag to publish (required when publish_release=true on branch runs)"
+        type: string
+        required: false
   push:
     tags:
       - "v*"
@@ -50,7 +60,7 @@ jobs:
         run: pnpm exec tauri build --target universal-apple-darwin --bundles app,dmg --no-sign
 
       - name: Upload installer artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: todo-studio-macos-universal
           if-no-files-found: error
@@ -59,10 +69,10 @@ jobs:
             src-tauri/target/universal-apple-darwin/release/bundle/**/*.app
 
       - name: Publish installers to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish_release == 'true' && github.event.inputs.release_tag != '')
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || github.event.inputs.release_tag }}
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
