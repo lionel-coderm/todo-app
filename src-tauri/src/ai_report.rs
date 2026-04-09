@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::models::{AppData, AppSettings};
 use crate::utils::normalize_optional_text;
+
+const MAX_AI_USER_PROMPT_CHARS: usize = 12_000;
 
 #[derive(Debug, Clone, Copy)]
 enum ReportPeriod {
@@ -53,8 +55,9 @@ impl ReportPeriod {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AiApiMode {
+    Auto,
     ChatCompletions,
     AnthropicMessages,
 }
@@ -83,9 +86,89 @@ struct ChatCompletionRequest {
 struct AnthropicMessagesRequest {
     model: String,
     max_tokens: u32,
-    temperature: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
     system: String,
-    messages: Vec<ChatMessage>,
+    messages: Vec<AnthropicMessage>,
+}
+
+#[derive(Serialize)]
+struct AnthropicMessage {
+    role: String,
+    content: Vec<AnthropicTextBlock>,
+}
+
+#[derive(Serialize)]
+struct AnthropicTextBlock {
+    #[serde(rename = "type")]
+    kind: String,
+    text: String,
+}
+
+trait AiProtocolAdapter: Send + Sync {
+    fn default_endpoint(&self, base_url: &str) -> String;
+    fn request_body(&self, model: &str, system_prompt: &str, user_prompt: &str) -> Value;
+    fn apply_headers(&self, request: reqwest::RequestBuilder, api_key: &str) -> reqwest::RequestBuilder;
+}
+
+struct ChatCompletionsAdapter;
+
+impl AiProtocolAdapter for ChatCompletionsAdapter {
+    fn default_endpoint(&self, base_url: &str) -> String {
+        build_chat_completions_url(base_url)
+    }
+
+    fn request_body(&self, model: &str, system_prompt: &str, user_prompt: &str) -> Value {
+        json!(ChatCompletionRequest {
+            model: model.to_string(),
+            temperature: 0.2,
+            messages: vec![
+                ChatMessage {
+                    role: "system".to_string(),
+                    content: system_prompt.to_string(),
+                },
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: user_prompt.to_string(),
+                },
+            ],
+        })
+    }
+
+    fn apply_headers(&self, request: reqwest::RequestBuilder, api_key: &str) -> reqwest::RequestBuilder {
+        request.bearer_auth(api_key)
+    }
+}
+
+struct AnthropicMessagesAdapter;
+
+impl AiProtocolAdapter for AnthropicMessagesAdapter {
+    fn default_endpoint(&self, base_url: &str) -> String {
+        build_anthropic_messages_url(base_url)
+    }
+
+    fn request_body(&self, model: &str, system_prompt: &str, user_prompt: &str) -> Value {
+        json!(AnthropicMessagesRequest {
+            model: model.to_string(),
+            max_tokens: 1024,
+            temperature: None,
+            system: system_prompt.to_string(),
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: vec![AnthropicTextBlock {
+                    kind: "text".to_string(),
+                    text: user_prompt.to_string(),
+                }],
+            }],
+        })
+    }
+
+    fn apply_headers(&self, request: reqwest::RequestBuilder, api_key: &str) -> reqwest::RequestBuilder {
+        request
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+    }
 }
 
 pub async fn generate_ai_report(
@@ -96,8 +179,11 @@ pub async fn generate_ai_report(
     let period = ReportPeriod::parse(period_raw)?;
     let model = normalize_optional_text(settings.ai_model.as_deref())
         .ok_or_else(|| "请先在设置中配置 AI 模型名称".to_string())?;
-    let base_url = normalize_optional_text(settings.ai_base_url.as_deref())
-        .ok_or_else(|| "请先在设置中配置 AI 请求地址".to_string())?;
+    let base_url = normalize_optional_text(settings.ai_base_url.as_deref());
+    let endpoint = normalize_optional_text(settings.ai_endpoint.as_deref());
+    if base_url.is_none() && endpoint.is_none() {
+        return Err("请先在设置中配置 AI 请求地址（请求地址或完整请求地址至少填写一个）".to_string());
+    }
     let api_key = normalize_optional_text(settings.ai_api_key.as_deref())
         .ok_or_else(|| "请先在设置中配置 AI API Key".to_string())?;
 
@@ -105,81 +191,76 @@ pub async fn generate_ai_report(
     let (start, end, window_desc) = period.range(now)?;
     let summary = build_report_summary(data, start, end);
     let system_prompt = build_system_prompt(period).to_string();
-    let user_prompt = build_user_prompt(period, &window_desc, start, end, summary);
+    let user_prompt = limit_user_prompt_length(
+        build_user_prompt(period, &window_desc, start, end, summary),
+        MAX_AI_USER_PROMPT_CHARS,
+    );
 
-    let api_mode = detect_api_mode(&base_url);
+    let (api_mode, allow_fallback) = resolve_mode_plan(
+        settings.ai_api_mode.as_deref(),
+        base_url.as_deref(),
+        endpoint.as_deref(),
+    )?;
+    let mode_candidates = resolve_mode_candidates(api_mode, allow_fallback);
     let client = Client::new();
-    let response = match api_mode {
-        AiApiMode::ChatCompletions => {
-            let request = ChatCompletionRequest {
-                model,
-                temperature: 0.2,
-                messages: vec![
-                    ChatMessage {
-                        role: "system".to_string(),
-                        content: system_prompt,
-                    },
-                    ChatMessage {
-                        role: "user".to_string(),
-                        content: user_prompt,
-                    },
-                ],
+    let mut attempt_errors: Vec<String> = Vec::new();
+
+    for (index, mode) in mode_candidates.iter().copied().enumerate() {
+        let (status, body) = send_ai_request(
+            &client,
+            mode,
+            base_url.as_deref(),
+            endpoint.as_deref(),
+            &api_key,
+            &model,
+            &system_prompt,
+            &user_prompt,
+        )
+        .await?;
+
+        let has_next = index + 1 < mode_candidates.len();
+        if status.is_success() {
+            let content = match parse_ai_response_text(&body) {
+                Ok(content) => content,
+                Err(parse_err) => {
+                    attempt_errors.push(format!(
+                        "{} 模式 (响应解析): {}",
+                        ai_api_mode_label(mode),
+                        truncate_text(&parse_err, 400)
+                    ));
+                    if has_next && should_retry_with_fallback_on_parse_error(&parse_err) {
+                        continue;
+                    }
+                    break;
+                }
             };
-
-            let url = build_chat_completions_url(&base_url);
-            client
-                .post(url)
-                .bearer_auth(api_key)
-                .json(&request)
-                .send()
-                .await
-                .map_err(|e| format!("请求 AI 接口失败: {e}"))?
+            let trimmed = content.trim();
+            if trimmed.is_empty() {
+                return Err("AI 返回内容为空，请稍后重试".to_string());
+            }
+            return Ok(trimmed.to_string());
         }
-        AiApiMode::AnthropicMessages => {
-            let request = AnthropicMessagesRequest {
-                model,
-                max_tokens: 4096,
-                temperature: 0.2,
-                system: system_prompt,
-                messages: vec![ChatMessage {
-                    role: "user".to_string(),
-                    content: user_prompt,
-                }],
-            };
-            let url = build_anthropic_messages_url(&base_url);
-            client
-                .post(url)
-                .header("x-api-key", &api_key)
-                .header("anthropic-version", "2023-06-01")
-                .header("content-type", "application/json")
-                .json(&request)
-                .send()
-                .await
-                .map_err(|e| format!("请求 AI 接口失败: {e}"))?
-        }
-    };
 
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|e| format!("读取 AI 响应失败: {e}"))?;
-
-    if !status.is_success() {
-        return Err(format!(
-            "AI 接口返回错误 (HTTP {}): {}",
+        attempt_errors.push(format!(
+            "{} 模式 (HTTP {}): {}",
+            ai_api_mode_label(mode),
             status.as_u16(),
             truncate_text(&body, 400)
         ));
+
+        if !(has_next && should_retry_with_fallback(status)) {
+            break;
+        }
     }
 
-    let content = parse_ai_response_text(&body)?;
-    let trimmed = content.trim();
-    if trimmed.is_empty() {
-        return Err("AI 返回内容为空，请稍后重试".to_string());
+    if attempt_errors.len() <= 1 {
+        return Err(format!("AI 接口返回错误: {}", attempt_errors[0]));
     }
 
-    Ok(trimmed.to_string())
+    Err(format!(
+        "AI 接口返回错误（自动模式已重试备选协议）: {}",
+        attempt_errors.join("；")
+    ))
 }
 
 fn parse_rfc3339_utc(raw: &Option<String>) -> Option<DateTime<Utc>> {
@@ -393,13 +474,201 @@ fn build_anthropic_messages_url(base_url: &str) -> String {
     format!("{normalized}/v1/messages")
 }
 
-fn detect_api_mode(base_url: &str) -> AiApiMode {
-    let normalized = base_url.trim().to_lowercase();
-    if normalized.contains("/anthropic") || normalized.ends_with("/v1/messages") {
-        AiApiMode::AnthropicMessages
-    } else {
-        AiApiMode::ChatCompletions
+fn adapter_for_mode(mode: AiApiMode) -> Box<dyn AiProtocolAdapter> {
+    match mode {
+        AiApiMode::ChatCompletions => Box::new(ChatCompletionsAdapter),
+        AiApiMode::AnthropicMessages => Box::new(AnthropicMessagesAdapter),
+        AiApiMode::Auto => Box::new(ChatCompletionsAdapter),
     }
+}
+
+fn ai_api_mode_label(mode: AiApiMode) -> &'static str {
+    match mode {
+        AiApiMode::Auto => "auto",
+        AiApiMode::ChatCompletions => "chat_completions",
+        AiApiMode::AnthropicMessages => "anthropic_messages",
+    }
+}
+
+fn resolve_mode_candidates(primary_mode: AiApiMode, allow_fallback: bool) -> Vec<AiApiMode> {
+    if !allow_fallback {
+        return vec![primary_mode];
+    }
+
+    match primary_mode {
+        AiApiMode::ChatCompletions => vec![AiApiMode::ChatCompletions, AiApiMode::AnthropicMessages],
+        AiApiMode::AnthropicMessages => vec![AiApiMode::AnthropicMessages, AiApiMode::ChatCompletions],
+        AiApiMode::Auto => vec![AiApiMode::ChatCompletions, AiApiMode::AnthropicMessages],
+    }
+}
+
+fn parse_configured_api_mode(raw: Option<&str>) -> Result<AiApiMode, String> {
+    let Some(normalized) = normalize_optional_text(raw) else {
+        return Ok(AiApiMode::Auto);
+    };
+    let normalized = normalized.to_lowercase();
+    match normalized.as_str() {
+        "auto" => Ok(AiApiMode::Auto),
+        "chat_completions" | "chat-completions" | "chatcompletions" => {
+            Ok(AiApiMode::ChatCompletions)
+        }
+        "anthropic_messages" | "anthropic-messages" | "anthropicmessages" | "anthropic" => {
+            Ok(AiApiMode::AnthropicMessages)
+        }
+        _ => Err(format!(
+            "AI 协议模式无效: {normalized}。支持 auto / chat_completions / anthropic_messages"
+        )),
+    }
+}
+
+fn resolve_mode_plan(
+    configured_mode: Option<&str>,
+    base_url: Option<&str>,
+    endpoint: Option<&str>,
+) -> Result<(AiApiMode, bool), String> {
+    let parsed = parse_configured_api_mode(configured_mode)?;
+    if parsed == AiApiMode::Auto {
+        Ok((detect_api_mode(base_url, endpoint), true))
+    } else {
+        Ok((parsed, false))
+    }
+}
+
+fn resolve_request_url(
+    adapter: &dyn AiProtocolAdapter,
+    base_url: Option<&str>,
+    endpoint: Option<&str>,
+) -> Result<String, String> {
+    if let Some(custom_endpoint) = endpoint {
+        let trimmed = custom_endpoint.trim();
+        if !trimmed.is_empty() {
+            if should_treat_endpoint_as_base_url(trimmed) {
+                return Ok(adapter.default_endpoint(trimmed));
+            }
+            return Ok(trimmed.to_string());
+        }
+    }
+
+    let base = base_url.ok_or_else(|| "请先在设置中配置 AI 请求地址".to_string())?;
+    Ok(adapter.default_endpoint(base))
+}
+
+fn is_likely_full_request_endpoint(url: &str) -> bool {
+    let normalized = url.trim().to_lowercase();
+    normalized.contains("/chat/completions")
+        || normalized.contains("/v1/messages")
+        || normalized.contains("/responses")
+}
+
+fn should_treat_endpoint_as_base_url(url: &str) -> bool {
+    if is_likely_full_request_endpoint(url) {
+        return false;
+    }
+
+    let normalized = url.trim().trim_end_matches('/').to_lowercase();
+    if normalized.is_empty() {
+        return true;
+    }
+
+    if normalized.ends_with("/v1")
+        || normalized.ends_with("/anthropic")
+        || normalized.ends_with("/anthropic/v1")
+    {
+        return true;
+    }
+
+    if let Ok(parsed) = reqwest::Url::parse(&normalized) {
+        let path = parsed.path().trim_end_matches('/');
+        return path.is_empty();
+    }
+
+    false
+}
+
+async fn send_ai_request(
+    client: &Client,
+    mode: AiApiMode,
+    base_url: Option<&str>,
+    endpoint: Option<&str>,
+    api_key: &str,
+    model: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+) -> Result<(StatusCode, String), String> {
+    let adapter = adapter_for_mode(mode);
+    let request_url = resolve_request_url(adapter.as_ref(), base_url, endpoint)?;
+    let request_body = adapter.request_body(model, system_prompt, user_prompt);
+    let request_builder = client.post(request_url);
+    let response = adapter
+        .apply_headers(request_builder, api_key)
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|e| format!("请求 AI 接口失败: {e}"))?;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("读取 AI 响应失败: {e}"))?;
+    Ok((status, body))
+}
+
+fn should_retry_with_fallback(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::BAD_REQUEST
+            | StatusCode::NOT_FOUND
+            | StatusCode::METHOD_NOT_ALLOWED
+            | StatusCode::UNSUPPORTED_MEDIA_TYPE
+            | StatusCode::UNPROCESSABLE_ENTITY
+    )
+}
+
+fn should_retry_with_fallback_on_parse_error(err: &str) -> bool {
+    let normalized = err.to_lowercase();
+    normalized.contains("404")
+        || normalized.contains("not_found")
+        || normalized.contains("not found")
+        || normalized.contains("method not allowed")
+        || normalized.contains("unsupported")
+        || normalized.contains("invalid_request")
+        || normalized.contains("参数有误")
+}
+
+fn detect_api_mode(base_url: Option<&str>, endpoint: Option<&str>) -> AiApiMode {
+    if endpoint
+        .map(looks_like_anthropic_endpoint)
+        .unwrap_or(false)
+    {
+        return AiApiMode::AnthropicMessages;
+    }
+
+    if base_url
+        .map(looks_like_anthropic_endpoint)
+        .unwrap_or(false)
+    {
+        return AiApiMode::AnthropicMessages;
+    }
+
+    AiApiMode::ChatCompletions
+}
+
+fn looks_like_anthropic_endpoint(raw: &str) -> bool {
+    let normalized = raw.trim().to_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+
+    if normalized.contains("anthropic.com") {
+        return true;
+    }
+
+    if normalized.contains("/anthropic") {
+        return true;
+    }
+
+    normalized.ends_with("/v1/messages") || normalized.contains("/v1/messages?")
 }
 
 fn parse_ai_response_text(body: &str) -> Result<String, String> {
@@ -514,11 +783,23 @@ fn extract_text_content(content: &Value) -> Option<String> {
     }
 }
 
+fn limit_user_prompt_length(prompt: String, max_chars: usize) -> String {
+    let char_count = prompt.chars().count();
+    if char_count <= max_chars {
+        return prompt;
+    }
+
+    let mut limited: String = prompt.chars().take(max_chars).collect();
+    limited.push_str("\n\n[注：输入数据过长，已自动截断以满足模型上下文限制。]");
+    limited
+}
+
 fn truncate_text(text: &str, max_len: usize) -> String {
-    if text.len() <= max_len {
+    let char_count = text.chars().count();
+    if char_count <= max_len {
         return text.to_string();
     }
-    let mut truncated = text[..max_len].to_string();
+    let mut truncated: String = text.chars().take(max_len).collect();
     truncated.push_str("...");
     truncated
 }
@@ -526,8 +807,10 @@ fn truncate_text(text: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_anthropic_messages_url, build_chat_completions_url, detect_api_mode,
-        parse_ai_response_text, AiApiMode,
+        adapter_for_mode, build_anthropic_messages_url, build_chat_completions_url, detect_api_mode,
+        is_likely_full_request_endpoint, limit_user_prompt_length, parse_ai_response_text,
+        resolve_mode_plan, resolve_request_url, should_retry_with_fallback_on_parse_error,
+        should_treat_endpoint_as_base_url, truncate_text, AiApiMode,
     };
     use serde_json::json;
 
@@ -566,13 +849,120 @@ mod tests {
     #[test]
     fn detect_api_mode_from_base_url() {
         assert!(matches!(
-            detect_api_mode("https://open.bigmodel.cn/api/anthropic"),
+            detect_api_mode(Some("https://open.bigmodel.cn/api/anthropic"), None),
             AiApiMode::AnthropicMessages
         ));
         assert!(matches!(
-            detect_api_mode("https://api.openai.com/v1"),
+            detect_api_mode(Some("https://api.openai.com/v1"), None),
             AiApiMode::ChatCompletions
         ));
+    }
+
+    #[test]
+    fn detect_api_mode_for_official_anthropic_v1_url() {
+        assert!(matches!(
+            detect_api_mode(Some("https://api.anthropic.com/v1"), None),
+            AiApiMode::AnthropicMessages
+        ));
+    }
+
+    #[test]
+    fn resolve_api_mode_respects_explicit_configuration() {
+        let (mode, allow_fallback) = resolve_mode_plan(
+                Some("chat_completions"),
+                Some("https://api.anthropic.com/v1"),
+                None
+            )
+            .expect("parse mode");
+        assert!(matches!(mode, AiApiMode::ChatCompletions));
+        assert!(!allow_fallback);
+
+        let (mode, allow_fallback) =
+            resolve_mode_plan(Some("anthropic_messages"), Some("https://api.openai.com/v1"), None)
+                .expect("parse mode");
+        assert!(matches!(mode, AiApiMode::AnthropicMessages));
+        assert!(!allow_fallback);
+    }
+
+    #[test]
+    fn resolve_request_url_prefers_endpoint_override() {
+        let adapter = adapter_for_mode(AiApiMode::ChatCompletions);
+        let url = resolve_request_url(
+            adapter.as_ref(),
+            Some("https://api.openai.com/v1"),
+            Some("https://gateway.example.com/custom/path"),
+        )
+        .expect("resolve endpoint");
+        assert_eq!(url, "https://gateway.example.com/custom/path");
+    }
+
+    #[test]
+    fn resolve_request_url_treats_endpoint_as_base_when_path_missing() {
+        let chat_adapter = adapter_for_mode(AiApiMode::ChatCompletions);
+        let chat_url = resolve_request_url(
+            chat_adapter.as_ref(),
+            Some("https://api.openai.com/v1"),
+            Some("https://api.anthropic.com/v1"),
+        )
+        .expect("resolve chat endpoint");
+        assert_eq!(chat_url, "https://api.anthropic.com/v1/chat/completions");
+
+        let anthropic_adapter = adapter_for_mode(AiApiMode::AnthropicMessages);
+        let anthropic_url = resolve_request_url(
+            anthropic_adapter.as_ref(),
+            Some("https://api.openai.com/v1"),
+            Some("https://api.anthropic.com/v1"),
+        )
+        .expect("resolve anthropic endpoint");
+        assert_eq!(anthropic_url, "https://api.anthropic.com/v1/messages");
+    }
+
+    #[test]
+    fn detect_full_request_endpoint_works_for_common_paths() {
+        assert!(is_likely_full_request_endpoint(
+            "https://api.openai.com/v1/chat/completions"
+        ));
+        assert!(is_likely_full_request_endpoint(
+            "https://api.anthropic.com/v1/messages"
+        ));
+        assert!(!is_likely_full_request_endpoint("https://api.anthropic.com/v1"));
+    }
+
+    #[test]
+    fn treat_only_base_like_endpoint_as_base_url() {
+        assert!(should_treat_endpoint_as_base_url("https://api.anthropic.com/v1"));
+        assert!(should_treat_endpoint_as_base_url("https://api.openai.com"));
+        assert!(!should_treat_endpoint_as_base_url(
+            "https://gateway.example.com/custom/path"
+        ));
+    }
+
+    #[test]
+    fn retry_fallback_on_retryable_parse_error() {
+        assert!(should_retry_with_fallback_on_parse_error(
+            "AI 接口返回错误: 404 NOT_FOUND"
+        ));
+        assert!(should_retry_with_fallback_on_parse_error(
+            "AI 接口返回错误: API 调用参数有误，请检查文档。"
+        ));
+        assert!(!should_retry_with_fallback_on_parse_error(
+            "AI 接口返回错误: unauthorized"
+        ));
+    }
+
+    #[test]
+    fn truncate_text_is_utf8_safe() {
+        let input = "你好，世界，hello";
+        let result = truncate_text(input, 5);
+        assert_eq!(result, "你好，世界...");
+    }
+
+    #[test]
+    fn limit_user_prompt_length_appends_notice_when_truncated() {
+        let input = "a".repeat(20);
+        let limited = limit_user_prompt_length(input, 8);
+        assert!(limited.starts_with("aaaaaaaa"));
+        assert!(limited.contains("已自动截断"));
     }
 
     #[test]

@@ -1,14 +1,17 @@
 <script setup lang="ts">
-import { computed, defineAsyncComponent, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
+import { computed, defineAsyncComponent, nextTick, onMounted } from 'vue';
 import { storeToRefs } from 'pinia';
-import { type TodoItem as TodoItemModel, TaskPriority } from '@/data/todos';
-import type { ReportPeriod, SearchFilter } from '@/services/storageService';
-import { generateAiReport, getDefaultDataDir, showMainWindow } from '@/services/storageService';
+import type { SearchFilter } from '@/services/storageService';
+import { showMainWindow } from '@/services/storageService';
 import { useTodoStore } from '@/stores/todo';
 import Sidebar from '@/components/Sidebar.vue';
 import HeaderBar from '@/components/HeaderBar.vue';
 import TodoItem from '@/components/TodoItem.vue';
 import TaskTimeline from '@/components/TaskTimeline.vue';
+import { useTaskModal } from '@/composables/useTaskModal';
+import { useCategoryModal } from '@/composables/useCategoryModal';
+import { useSettingsModal } from '@/composables/useSettingsModal';
+import { useTaskDetail } from '@/composables/useTaskDetail';
 
 async function loadModalComponent<T>(loader: () => Promise<T>) {
   await import('@/modals.css');
@@ -42,9 +45,6 @@ const {
 } = storeToRefs(todoStore);
 const {
   toggleTodo,
-  updateSettings,
-  updateCategory,
-  updateTodo,
   moveToTrash,
   restoreTodo,
   permanentlyDeleteTodo,
@@ -74,287 +74,75 @@ const currentFilterTitle = computed(() => {
 
 const defaultTaskCategoryId = computed(() => categories.value[0]?.id || '');
 
-const isTaskModalOpen = ref(false);
-const editingTaskId = ref<number | null>(null);
-const taskSaveSuccess = ref(false);
-let taskSaveSuccessTimer: ReturnType<typeof setTimeout> | null = null;
-const taskForm = ref({
-  title: '',
-  categoryId: '',
-  priority: TaskPriority.Low as TaskPriority,
-  description: '',
+const {
+  viewTaskData,
+  openTaskDetail,
+  closeTaskDetail,
+  handleToggleFromDetail,
+} = useTaskDetail({
+  toggleTodo,
 });
 
-onUnmounted(() => {
-  if (taskSaveSuccessTimer) {
-    clearTimeout(taskSaveSuccessTimer);
-    taskSaveSuccessTimer = null;
-  }
-});
-
-watch(
+const {
+  isTaskModalOpen,
+  editingTaskId,
+  taskSaveSuccess,
+  taskForm,
+  openTaskModal,
+  closeTaskModal,
+  startEditTask,
+  submitTask,
+} = useTaskModal({
   defaultTaskCategoryId,
-  (categoryId) => {
-    if (!editingTaskId.value && !taskForm.value.categoryId && categoryId) {
-      taskForm.value.categoryId = categoryId;
-    }
-  },
-  { immediate: true },
-);
-
-function resetTaskForm() {
-  editingTaskId.value = null;
-  taskForm.value = {
-    title: '',
-    categoryId: defaultTaskCategoryId.value,
-    priority: TaskPriority.Low,
-    description: '',
-  };
-}
-
-function openTaskModal() {
-  taskSaveSuccess.value = false;
-  resetTaskForm();
-  isTaskModalOpen.value = true;
-}
-
-function closeTaskModal() {
-  isTaskModalOpen.value = false;
-  resetTaskForm();
-}
-
-function startEditTask(todo: TodoItemModel) {
-  taskSaveSuccess.value = false;
-  editingTaskId.value = todo.id;
-  taskForm.value = {
-    title: todo.title,
-    categoryId: todo.categoryId,
-    priority: todo.priority,
-    description: todo.description || '',
-  };
-  closeTaskDetail();
-  isTaskModalOpen.value = true;
-}
-
-async function submitTask() {
-  if (!taskForm.value.title.trim()) return;
-  if (!taskForm.value.categoryId) return;
-
-  const isEditingTask = editingTaskId.value !== null;
-
-  if (isEditingTask) {
-    const taskId = editingTaskId.value;
-    if (taskId === null) return;
-
-    await updateTodo(
-        taskId,
-        taskForm.value.title.trim(),
-        taskForm.value.priority,
-        taskForm.value.categoryId,
-        taskForm.value.description.trim(),
-    );
-
-    taskSaveSuccess.value = true;
-    if (taskSaveSuccessTimer) clearTimeout(taskSaveSuccessTimer);
-    taskSaveSuccessTimer = setTimeout(() => {
-      taskSaveSuccess.value = false;
-      taskSaveSuccessTimer = null;
-    }, 1800);
-  } else {
-    await todoStore.addTodo(
-      taskForm.value.title.trim(),
-      taskForm.value.priority,
-      taskForm.value.categoryId,
-      taskForm.value.description.trim(),
-    );
-  }
-
-  closeTaskModal();
-}
-
-const isCategoryModalOpen = ref(false);
-const presetColors = ['#0A84FF', '#30D158', '#FF9F0A', '#FF453A', '#98989D', '#AF52DE'];
-const presetCategoryIcons = ['📁', '💼', '💻', '📚', '🏠', '🛒', '🏃', '💡', '🎯', '✈️', '🎵', '🍽️'];
-const editingCategoryId = ref<string | null>(null);
-const categoryForm = ref({ name: '', color: '#0A84FF', icon: '📁' });
-
-function resetCategoryForm() {
-  editingCategoryId.value = null;
-  categoryForm.value = { name: '', color: '#0A84FF', icon: '📁' };
-}
-
-function openCategoryModal() {
-  isCategoryModalOpen.value = true;
-}
-
-function closeCategoryModal() {
-  isCategoryModalOpen.value = false;
-  resetCategoryForm();
-}
-
-function startEditCategory(categoryId: string) {
-  const target = categories.value.find((category) => category.id === categoryId);
-  if (!target) return;
-  editingCategoryId.value = categoryId;
-  categoryForm.value = {
-    name: target.name,
-    color: target.color,
-    icon: target.icon,
-  };
-}
-
-function cancelEditCategory() {
-  resetCategoryForm();
-}
-
-function submitCategory() {
-  if (!categoryForm.value.name.trim() || !categoryForm.value.icon.trim()) return;
-
-  if (editingCategoryId.value) {
-    updateCategory(
-      editingCategoryId.value,
-      categoryForm.value.name.trim(),
-      categoryForm.value.color,
-      categoryForm.value.icon.trim(),
-    );
-  } else {
-    todoStore.addCategory(
-      categoryForm.value.name.trim(),
-      categoryForm.value.color,
-      categoryForm.value.icon.trim(),
-    );
-  }
-
-  resetCategoryForm();
-}
-
-const isDeleteCategoryConfirmOpen = ref(false);
-const pendingDeleteCategoryId = ref<string | null>(null);
-const pendingDeleteCategoryName = ref('');
-const pendingDeleteCategoryTaskCount = ref(0);
-
-function closeDeleteCategoryConfirm() {
-  isDeleteCategoryConfirmOpen.value = false;
-  pendingDeleteCategoryId.value = null;
-  pendingDeleteCategoryName.value = '';
-  pendingDeleteCategoryTaskCount.value = 0;
-}
-
-function handleDeleteCategory(categoryId: string) {
-  const target = categories.value.find((category) => category.id === categoryId);
-  if (!target) return;
-
-  pendingDeleteCategoryId.value = categoryId;
-  pendingDeleteCategoryName.value = target.name;
-  pendingDeleteCategoryTaskCount.value = todos.value.filter((todo) => todo.categoryId === categoryId).length;
-  isDeleteCategoryConfirmOpen.value = true;
-}
-
-function confirmDeleteCategory() {
-  const categoryId = pendingDeleteCategoryId.value;
-  if (!categoryId) return;
-
-  todoStore.deleteCategory(categoryId);
-
-  if (editingCategoryId.value === categoryId) {
-    resetCategoryForm();
-  }
-
-  closeDeleteCategoryConfirm();
-}
-
-const isSettingsModalOpen = ref(false);
-const isSavingSettings = ref(false);
-const settingsSaveError = ref<string | null>(null);
-const settingsSaveSuccess = ref(false);
-const defaultDataDirPlaceholder = ref('加载中...');
-const isGeneratingReport = ref(false);
-const reportError = ref<string | null>(null);
-const reportContent = ref('');
-const reportPeriod = ref<ReportPeriod>('weekly');
-
-const settingsForm = ref({
-  theme: 'light',
-  dataLocation: '' as string,
-  dataFormat: 'json' as 'json' | 'sqlite',
-  aiModel: '',
-  aiBaseUrl: '',
-  aiApiKey: '',
+  addTodo: todoStore.addTodo,
+  updateTodo: todoStore.updateTodo,
+  onBeforeEditTask: closeTaskDetail,
 });
 
-async function openSettingsModal() {
-  settingsForm.value.dataFormat = currentSettings.value.storageType;
-  settingsForm.value.dataLocation = currentSettings.value.dataDir ?? '';
-  settingsForm.value.aiModel = currentSettings.value.aiModel ?? '';
-  settingsForm.value.aiBaseUrl = currentSettings.value.aiBaseUrl ?? '';
-  settingsForm.value.aiApiKey = currentSettings.value.aiApiKey ?? '';
-  settingsSaveError.value = null;
-  settingsSaveSuccess.value = false;
-  reportError.value = null;
-  try {
-    defaultDataDirPlaceholder.value = await getDefaultDataDir();
-  } catch {
-    defaultDataDirPlaceholder.value = '~/Library/Application Support/com.todo.studio';
-  }
-  isSettingsModalOpen.value = true;
-}
+const {
+  isCategoryModalOpen,
+  editingCategoryId,
+  categoryForm,
+  isDeleteCategoryConfirmOpen,
+  pendingDeleteCategoryName,
+  pendingDeleteCategoryTaskCount,
+  presetColors,
+  presetCategoryIcons,
+  openCategoryModal,
+  closeCategoryModal,
+  startEditCategory,
+  cancelEditCategory,
+  submitCategory,
+  handleDeleteCategory,
+  closeDeleteCategoryConfirm,
+  confirmDeleteCategory,
+} = useCategoryModal({
+  categories,
+  todos,
+  addCategory: todoStore.addCategory,
+  updateCategory: todoStore.updateCategory,
+  deleteCategory: todoStore.deleteCategory,
+});
 
-function closeSettingsModal() {
-  isSettingsModalOpen.value = false;
-}
-
-async function handleSaveSettings() {
-  if (isSavingSettings.value) return;
-  settingsSaveError.value = null;
-  settingsSaveSuccess.value = false;
-  isSavingSettings.value = true;
-
-  try {
-    await updateSettings(settingsForm.value.dataFormat, settingsForm.value.dataLocation, {
-      aiModel: settingsForm.value.aiModel,
-      aiBaseUrl: settingsForm.value.aiBaseUrl,
-      aiApiKey: settingsForm.value.aiApiKey,
-    });
-    settingsSaveSuccess.value = true;
-    setTimeout(() => {
-      settingsSaveSuccess.value = false;
-    }, 2000);
-  } catch (err) {
-    settingsSaveError.value = String(err);
-  } finally {
-    isSavingSettings.value = false;
-  }
-}
-
-async function handleGenerateReport(period: ReportPeriod) {
-  if (isGeneratingReport.value) return;
-  reportError.value = null;
-  reportPeriod.value = period;
-  isGeneratingReport.value = true;
-  try {
-    const generated = await generateAiReport(period);
-    reportContent.value = generated;
-  } catch (err) {
-    reportError.value = String(err);
-  } finally {
-    isGeneratingReport.value = false;
-  }
-}
-
-const viewTaskData = ref<TodoItemModel | null>(null);
-
-function openTaskDetail(todo: TodoItemModel) {
-  viewTaskData.value = todo;
-}
-
-function closeTaskDetail() {
-  viewTaskData.value = null;
-}
-
-function handleToggleFromDetail(id: number) {
-  toggleTodo(id);
-  closeTaskDetail();
-}
+const {
+  isSettingsModalOpen,
+  isSavingSettings,
+  settingsSaveError,
+  settingsSaveSuccess,
+  defaultDataDirPlaceholder,
+  isGeneratingReport,
+  reportError,
+  reportContent,
+  reportPeriod,
+  settingsForm,
+  openSettingsModal,
+  closeSettingsModal,
+  handleSaveSettings,
+  handleGenerateReport,
+} = useSettingsModal({
+  currentSettings,
+  updateSettings: todoStore.updateSettings,
+});
 
 function handleSelectFilter(value: SearchFilter) {
   filter.value = value;
@@ -434,7 +222,6 @@ function handleSelectCategory(id: string | null) {
 
     <Teleport to="body">
       <TaskModal
-        v-if="isTaskModalOpen"
         :visible="isTaskModalOpen"
         :editing-task-id="editingTaskId"
         :categories="categories"
@@ -498,6 +285,8 @@ function handleSelectCategory(id: string | null) {
         :data-format="settingsForm.dataFormat"
         :ai-model="settingsForm.aiModel"
         :ai-base-url="settingsForm.aiBaseUrl"
+        :ai-api-mode="settingsForm.aiApiMode"
+        :ai-endpoint="settingsForm.aiEndpoint"
         :ai-api-key="settingsForm.aiApiKey"
         :default-data-dir-placeholder="defaultDataDirPlaceholder"
         :is-saving="isSavingSettings"
@@ -515,6 +304,8 @@ function handleSelectCategory(id: string | null) {
         @update:data-format="settingsForm.dataFormat = $event"
         @update:ai-model="settingsForm.aiModel = $event"
         @update:ai-base-url="settingsForm.aiBaseUrl = $event"
+        @update:ai-api-mode="settingsForm.aiApiMode = $event"
+        @update:ai-endpoint="settingsForm.aiEndpoint = $event"
         @update:ai-api-key="settingsForm.aiApiKey = $event"
       />
 

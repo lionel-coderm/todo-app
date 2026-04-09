@@ -343,7 +343,7 @@ impl SqliteStorage {
         let mut stmt = conn
             .prepare("SELECT id, name, color, icon FROM categories")
             .map_err(|e| e.to_string())?;
-        let categories: Vec<CategoryItem> = stmt
+        let mapped = stmt
             .query_map([], |row| {
                 Ok(CategoryItem {
                     id: row.get(0)?,
@@ -352,9 +352,13 @@ impl SqliteStorage {
                     icon: row.get(3)?,
                 })
             })
-            .map_err(|e| e.to_string())?
-            .filter_map(|r| r.ok())
-            .collect();
+            .map_err(|e| e.to_string())?;
+
+        let mut categories: Vec<CategoryItem> = Vec::new();
+        for (row_index, item) in mapped.enumerate() {
+            let category = item.map_err(|e| format!("读取分类第{}行失败: {e}", row_index + 1))?;
+            categories.push(category);
+        }
 
         Ok(categories)
     }
@@ -701,6 +705,28 @@ mod tests {
             SqliteStorage::has_table(&conn, "categories").expect("check categories table");
         assert!(has_todos);
         assert!(has_categories);
+    }
+
+    #[test]
+    fn load_categories_returns_error_on_row_decode_failure() {
+        let conn = Connection::open_in_memory().expect("open sqlite");
+        conn.execute_batch(
+            "
+            CREATE TABLE categories (
+                id TEXT,
+                name TEXT,
+                color TEXT,
+                icon TEXT
+            );
+            INSERT INTO categories (id, name, color, icon)
+            VALUES ('cat-1', '坏数据分类', NULL, '📁');
+            ",
+        )
+        .expect("seed categories");
+
+        let result = SqliteStorage::load_categories(&conn);
+        let err = result.expect_err("should fail on invalid category row");
+        assert!(err.contains("读取分类第1行失败"), "{err}");
     }
 }
 

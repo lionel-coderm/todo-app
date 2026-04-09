@@ -1,13 +1,16 @@
 <script setup lang="ts">
 import { onBeforeUnmount, ref } from 'vue';
+import type { AppTheme } from '@/services/storageService';
 
 const props = defineProps<{
   visible: boolean;
-  theme: string;
+  theme: AppTheme;
   dataLocation: string;
   dataFormat: 'json' | 'sqlite';
   aiModel: string;
   aiBaseUrl: string;
+  aiApiMode: 'auto' | 'chat_completions' | 'anthropic_messages';
+  aiEndpoint: string;
   aiApiKey: string;
   defaultDataDirPlaceholder: string;
   isSaving: boolean;
@@ -22,26 +25,36 @@ const props = defineProps<{
 const emit = defineEmits<{
   close: [];
   save: [];
-  'update:theme': [value: string];
+  'update:theme': [value: AppTheme];
   'update:dataLocation': [value: string];
   'update:dataFormat': [value: 'json' | 'sqlite'];
   'update:aiModel': [value: string];
   'update:aiBaseUrl': [value: string];
+  'update:aiApiMode': [value: 'auto' | 'chat_completions' | 'anthropic_messages'];
+  'update:aiEndpoint': [value: string];
   'update:aiApiKey': [value: string];
   'generate-report': [period: 'weekly' | 'monthly'];
 }>();
 
-function updateInput(name: 'theme' | 'dataLocation' | 'aiModel' | 'aiBaseUrl' | 'aiApiKey', event: Event) {
+function updateTheme(event: Event) {
+  emit('update:theme', (event.target as HTMLInputElement).value as AppTheme);
+}
+
+function updateInput(name: 'dataLocation' | 'aiModel' | 'aiBaseUrl' | 'aiEndpoint' | 'aiApiKey', event: Event) {
   const value = (event.target as HTMLInputElement).value;
-  if (name === 'theme') emit('update:theme', value);
   if (name === 'dataLocation') emit('update:dataLocation', value);
   if (name === 'aiModel') emit('update:aiModel', value);
   if (name === 'aiBaseUrl') emit('update:aiBaseUrl', value);
+  if (name === 'aiEndpoint') emit('update:aiEndpoint', value);
   if (name === 'aiApiKey') emit('update:aiApiKey', value);
 }
 
 function updateDataFormat(event: Event) {
   emit('update:dataFormat', (event.target as HTMLInputElement).value as 'json' | 'sqlite');
+}
+
+function updateAiApiMode(event: Event) {
+  emit('update:aiApiMode', (event.target as HTMLSelectElement).value as 'auto' | 'chat_completions' | 'anthropic_messages');
 }
 
 function reportPeriodLabel(period: 'weekly' | 'monthly') {
@@ -126,7 +139,7 @@ onBeforeUnmount(() => {
                       type="radio"
                       :checked="props.theme === 'light'"
                       value="light"
-                      @change="updateInput('theme', $event)"
+                      @change="updateTheme"
                     />
                     亮色模式
                   </label>
@@ -135,7 +148,7 @@ onBeforeUnmount(() => {
                       type="radio"
                       :checked="props.theme === 'dark'"
                       value="dark"
-                      @change="updateInput('theme', $event)"
+                      @change="updateTheme"
                     />
                     深色模式
                   </label>
@@ -219,6 +232,26 @@ onBeforeUnmount(() => {
                   class="settings-input"
                   @input="updateInput('aiBaseUrl', $event)"
                 />
+              </div>
+              <div class="form-group">
+                <label>请求协议</label>
+                <select class="settings-input" :value="props.aiApiMode" @change="updateAiApiMode">
+                  <option value="auto">自动识别 (推荐)</option>
+                  <option value="chat_completions">Chat Completions 兼容协议</option>
+                  <option value="anthropic_messages">Anthropic Messages 协议</option>
+                </select>
+                <span class="settings-tip">建议在网关场景显式选择协议，避免地址推断歧义</span>
+              </div>
+              <div class="form-group">
+                <label>完整请求地址（可选）</label>
+                <input
+                  type="text"
+                  :value="props.aiEndpoint"
+                  placeholder="例如: https://api.anthropic.com/v1/messages"
+                  class="settings-input"
+                  @input="updateInput('aiEndpoint', $event)"
+                />
+                <span class="settings-tip">配置后优先于“请求地址”自动拼接，适用于自定义网关</span>
               </div>
               <div class="report-actions">
                 <button

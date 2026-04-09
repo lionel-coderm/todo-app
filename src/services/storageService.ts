@@ -8,12 +8,19 @@ export interface AppData {
   categories: CategoryItem[];
 }
 
+export type AiApiMode = 'auto' | 'chat_completions' | 'anthropic_messages';
+export type AppTheme = 'light' | 'dark';
+
 export interface AppSettings {
   storageType: 'json' | 'sqlite';
+  theme?: AppTheme;
   dataDir?: string; // 自定义数据目录，undefined 或空字符串 = 系统默认
   aiModel?: string;
   aiBaseUrl?: string;
+  aiApiMode?: AiApiMode; // AI 协议模式，auto 表示根据地址推断
+  aiEndpoint?: string; // 可选：完整请求地址，配置后优先使用
   aiApiKey?: string;
+  isInitialized?: boolean; // 显式首启标记，避免空数据被误判为首次启动
 }
 
 export type SearchFilter = 'all' | 'active' | 'completed' | 'trash';

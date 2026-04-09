@@ -92,10 +92,19 @@ fn read_settings(system_dir: &PathBuf) -> AppSettings {
     if !path.exists() {
         return AppSettings::default();
     }
-    fs::read_to_string(&path)
+
+    let mut settings: AppSettings = fs::read_to_string(&path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    settings = normalize_settings(settings);
+
+    // 兼容旧版本：若 settings.json 已存在但没有该字段，默认视为已初始化。
+    if settings.is_initialized.is_none() {
+        settings.is_initialized = Some(true);
+    }
+
+    settings
 }
 
 /// 展开 ~ 为真实 home 目录
@@ -123,6 +132,15 @@ fn effective_data_dir(app: &tauri::AppHandle, settings: &AppSettings) -> Result<
 }
 
 fn normalize_settings(mut settings: AppSettings) -> AppSettings {
+    let theme = settings.theme.take();
+    settings.theme = normalize_optional_text(theme.as_deref()).and_then(|value| {
+        let normalized = value.to_lowercase();
+        match normalized.as_str() {
+            "light" | "dark" => Some(normalized),
+            _ => None,
+        }
+    });
+
     let data_dir = settings.data_dir.take();
     settings.data_dir = normalize_optional_text(data_dir.as_deref());
 
@@ -131,6 +149,12 @@ fn normalize_settings(mut settings: AppSettings) -> AppSettings {
 
     let ai_base_url = settings.ai_base_url.take();
     settings.ai_base_url = normalize_optional_text(ai_base_url.as_deref());
+
+    let ai_api_mode = settings.ai_api_mode.take();
+    settings.ai_api_mode = normalize_optional_text(ai_api_mode.as_deref());
+
+    let ai_endpoint = settings.ai_endpoint.take();
+    settings.ai_endpoint = normalize_optional_text(ai_endpoint.as_deref());
 
     let ai_api_key = settings.ai_api_key.take();
     settings.ai_api_key = normalize_optional_text(ai_api_key.as_deref());

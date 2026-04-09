@@ -14,6 +14,7 @@ import {
   saveAppData,
   loadSettings,
   saveSettings,
+  type AppTheme,
   type AppSettings,
   type SearchFilter,
 } from '@/services/storageService';
@@ -64,6 +65,31 @@ function createDefaultAppData(): { todos: TodoItem[]; categories: CategoryItem[]
 
 function normalizeTodos(todos: TodoItem[]) {
   return todos.map(normalizeTodo);
+}
+
+function normalizeAiApiMode(value?: string): AppSettings['aiApiMode'] {
+  const normalized = normalizeOptionalText(value);
+  if (!normalized) return undefined;
+  if (normalized === 'auto' || normalized === 'chat_completions' || normalized === 'anthropic_messages') {
+    return normalized;
+  }
+  return undefined;
+}
+
+function normalizeTheme(value?: string): AppTheme {
+  return value === 'dark' ? 'dark' : 'light';
+}
+
+function withNormalizedTheme(settings: AppSettings): AppSettings {
+  return {
+    ...settings,
+    theme: normalizeTheme(settings.theme),
+  };
+}
+
+function applyTheme(theme: AppTheme) {
+  if (typeof document === 'undefined') return;
+  document.documentElement.setAttribute('data-theme', theme);
 }
 
 const APP_CACHE_KEY = 'todo-studio-cache-v1';
@@ -233,16 +259,16 @@ export const useTodoStore = defineStore('todo', () => {
   const isLoading = ref(false);
   const isSearching = ref(false);
   const storageError = ref<string | null>(null);
-  const currentSettings = ref<AppSettings>({ storageType: 'json' });
+  const currentSettings = ref<AppSettings>({ storageType: 'json', theme: 'light' });
   const cachedSnapshot = readAppCache();
 
   if (cachedSnapshot) {
     todos.value = normalizeTodos(cachedSnapshot.todos);
     categories.value = cachedSnapshot.categories;
-    currentSettings.value = {
+    currentSettings.value = withNormalizedTheme({
       ...currentSettings.value,
       ...cachedSnapshot.settings,
-    };
+    });
   }
 
   function applySortOrder(items: TodoItem[]): TodoItem[] {
@@ -322,6 +348,14 @@ export const useTodoStore = defineStore('todo', () => {
   });
 
   watch(
+    () => currentSettings.value.theme,
+    (theme) => {
+      applyTheme(normalizeTheme(theme));
+    },
+    { immediate: true },
+  );
+
+  watch(
     [todos, categories],
     () => {
       if (!searchQuery.value.trim()) {
@@ -373,13 +407,17 @@ export const useTodoStore = defineStore('todo', () => {
     isLoading.value = true;
     storageError.value = null;
     try {
-      const [settings, data] = await Promise.all([
+      const [loadedSettings, data] = await Promise.all([
         loadSettings(),
         loadAppData(),
       ]);
+      const settings = withNormalizedTheme(loadedSettings);
       currentSettings.value = settings;
 
-      if (data.todos.length > 0 || data.categories.length > 0) {
+      const hasPersistedData = data.todos.length > 0 || data.categories.length > 0;
+      const alreadyInitialized = settings.isInitialized === true;
+
+      if (alreadyInitialized || hasPersistedData) {
         todos.value = normalizeTodos(data.todos);
         categories.value = data.categories;
       } else {
@@ -388,6 +426,15 @@ export const useTodoStore = defineStore('todo', () => {
         todos.value = defaultData.todos;
         categories.value = defaultData.categories;
         await saveAppData({ todos: todos.value, categories: categories.value });
+      }
+
+      if (!alreadyInitialized) {
+        const initializedSettings: AppSettings = withNormalizedTheme({
+          ...currentSettings.value,
+          isInitialized: true,
+        });
+        await saveSettings(initializedSettings, { todos: todos.value, categories: categories.value });
+        currentSettings.value = initializedSettings;
       }
 
       if (!searchQuery.value.trim()) {
@@ -439,24 +486,27 @@ export const useTodoStore = defineStore('todo', () => {
       : mutationStrategies.json;
   });
 
-  async function runMutation(operation: (strategy: TodoMutationStrategy) => Promise<void>) {
+  async function runMutation(operation: (strategy: TodoMutationStrategy) => Promise<void>): Promise<boolean> {
     try {
       await operation(currentMutationStrategy.value);
+      return true;
     } catch (err) {
       console.error('[TodoStore] 变更操作失败:', err);
       storageError.value = String(err);
+      return false;
     }
   }
 
   async function runMutationWithResult<T>(
     operation: (strategy: TodoMutationStrategy) => Promise<T>
-  ): Promise<T | undefined> {
+  ): Promise<{ ok: true; value: T } | { ok: false }> {
     try {
-      return await operation(currentMutationStrategy.value);
+      const value = await operation(currentMutationStrategy.value);
+      return { ok: true, value };
     } catch (err) {
       console.error('[TodoStore] 变更操作失败:', err);
       storageError.value = String(err);
-      return undefined;
+      return { ok: false };
     }
   }
 
@@ -465,7 +515,7 @@ export const useTodoStore = defineStore('todo', () => {
   }
 
   async function toggleTodo(id: number) {
-    await runMutation((strategy) => strategy.toggleTodo(id));
+    return runMutation((strategy) => strategy.toggleTodo(id));
   }
 
   async function addTodo(
@@ -474,7 +524,7 @@ export const useTodoStore = defineStore('todo', () => {
     categoryId: string,
     description?: string
   ) {
-    await runMutation((strategy) => strategy.addTodo(title, priority, categoryId, description));
+    return runMutation((strategy) => strategy.addTodo(title, priority, categoryId, description));
   }
 
   async function updateTodo(
@@ -484,35 +534,36 @@ export const useTodoStore = defineStore('todo', () => {
     categoryId: string,
     description?: string
   ) {
-    await runMutation((strategy) => strategy.updateTodo(id, title, priority, categoryId, description));
+    return runMutation((strategy) => strategy.updateTodo(id, title, priority, categoryId, description));
   }
 
   async function addCategory(name: string, color: string, icon: string) {
-    return runMutationWithResult((strategy) => strategy.addCategory(name, color, icon));
+    const result = await runMutationWithResult((strategy) => strategy.addCategory(name, color, icon));
+    return result.ok;
   }
 
   async function updateCategory(id: string, name: string, color: string, icon: string) {
-    await runMutation((strategy) => strategy.updateCategory(id, name, color, icon));
+    return runMutation((strategy) => strategy.updateCategory(id, name, color, icon));
   }
 
   async function deleteCategory(id: string) {
-    await runMutation((strategy) => strategy.deleteCategory(id));
+    return runMutation((strategy) => strategy.deleteCategory(id));
   }
 
   async function moveToTrash(id: number) {
-    await runMutation((strategy) => strategy.moveToTrash(id));
+    return runMutation((strategy) => strategy.moveToTrash(id));
   }
 
   async function restoreTodo(id: number) {
-    await runMutation((strategy) => strategy.restoreTodo(id));
+    return runMutation((strategy) => strategy.restoreTodo(id));
   }
 
   async function permanentlyDeleteTodo(id: number) {
-    await runMutation((strategy) => strategy.permanentlyDeleteTodo(id));
+    return runMutation((strategy) => strategy.permanentlyDeleteTodo(id));
   }
 
   async function clearTrash() {
-    await runMutation((strategy) => strategy.clearTrash());
+    return runMutation((strategy) => strategy.clearTrash());
   }
 
   // ─── 设置更新 ─────────────────────────────────────
@@ -520,18 +571,25 @@ export const useTodoStore = defineStore('todo', () => {
   async function updateSettings(
     newType: 'json' | 'sqlite',
     newDataDir?: string,
+    newTheme?: AppTheme,
     aiConfig?: {
       aiModel?: string;
       aiBaseUrl?: string;
+      aiApiMode?: AppSettings['aiApiMode'];
+      aiEndpoint?: string;
       aiApiKey?: string;
     },
   ) {
     const newSettings: AppSettings = {
       storageType: newType,
+      theme: normalizeTheme(newTheme),
       dataDir: normalizeOptionalText(newDataDir),
       aiModel: normalizeOptionalText(aiConfig?.aiModel),
       aiBaseUrl: normalizeOptionalText(aiConfig?.aiBaseUrl),
+      aiApiMode: normalizeAiApiMode(aiConfig?.aiApiMode),
+      aiEndpoint: normalizeOptionalText(aiConfig?.aiEndpoint),
       aiApiKey: normalizeOptionalText(aiConfig?.aiApiKey),
+      isInitialized: currentSettings.value.isInitialized,
     };
     try {
       await saveSettings(newSettings, { todos: todos.value, categories: categories.value });
