@@ -77,7 +77,8 @@ impl ManageConnection for SqliteConnectionManager {
     }
 
     fn is_valid(&self, conn: &mut Self::Connection) -> Result<(), Self::Error> {
-        conn.execute("SELECT 1", []).map(|_| ()).map_err(Into::into)
+        conn.query_row("SELECT 1", [], |_| Ok(()))
+            .map_err(Into::into)
     }
 
     fn has_broken(&self, _: &mut Self::Connection) -> bool {
@@ -234,9 +235,9 @@ impl SqliteStorage {
         let db_path = data_dir.join("todos.db");
         let manager = SqliteConnectionManager::new(db_path.clone());
         let pool = Pool::builder()
-            .max_size(8)
+            .max_size(32)
             .min_idle(Some(1))
-            .connection_timeout(Duration::from_secs(5))
+            .connection_timeout(Duration::from_secs(2))
             .build(manager)
             .map_err(|e| format!("创建 SQLite 连接池失败: {e}"))?;
 

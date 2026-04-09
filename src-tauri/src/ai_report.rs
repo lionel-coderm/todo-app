@@ -2,10 +2,11 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::models::{AppData, AppSettings};
+use crate::utils::normalize_optional_text;
 
 #[derive(Debug, Clone, Copy)]
 enum ReportPeriod {
@@ -52,6 +53,12 @@ impl ReportPeriod {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum AiApiMode {
+    ChatCompletions,
+    AnthropicMessages,
+}
+
 #[derive(Default)]
 struct CategoryStats {
     created: usize,
@@ -72,20 +79,13 @@ struct ChatCompletionRequest {
     messages: Vec<ChatMessage>,
 }
 
-#[derive(Deserialize)]
-struct ChatCompletionResponse {
-    choices: Vec<ChatChoice>,
-}
-
-#[derive(Deserialize)]
-struct ChatChoice {
-    message: ChatChoiceMessage,
-}
-
-#[derive(Deserialize)]
-struct ChatChoiceMessage {
-    #[serde(default)]
-    content: Value,
+#[derive(Serialize)]
+struct AnthropicMessagesRequest {
+    model: String,
+    max_tokens: u32,
+    temperature: f32,
+    system: String,
+    messages: Vec<ChatMessage>,
 }
 
 pub async fn generate_ai_report(
@@ -94,42 +94,70 @@ pub async fn generate_ai_report(
     period_raw: &str,
 ) -> Result<String, String> {
     let period = ReportPeriod::parse(period_raw)?;
-    let model = normalize_config_field(settings.ai_model.as_deref())
+    let model = normalize_optional_text(settings.ai_model.as_deref())
         .ok_or_else(|| "请先在设置中配置 AI 模型名称".to_string())?;
-    let base_url = normalize_config_field(settings.ai_base_url.as_deref())
+    let base_url = normalize_optional_text(settings.ai_base_url.as_deref())
         .ok_or_else(|| "请先在设置中配置 AI 请求地址".to_string())?;
-    let api_key = normalize_config_field(settings.ai_api_key.as_deref())
+    let api_key = normalize_optional_text(settings.ai_api_key.as_deref())
         .ok_or_else(|| "请先在设置中配置 AI API Key".to_string())?;
 
     let now = Utc::now();
     let (start, end, window_desc) = period.range(now)?;
     let summary = build_report_summary(data, start, end);
+    let system_prompt = build_system_prompt(period).to_string();
     let user_prompt = build_user_prompt(period, &window_desc, start, end, summary);
 
-    let request = ChatCompletionRequest {
-        model,
-        temperature: 0.2,
-        messages: vec![
-            ChatMessage {
-                role: "system".to_string(),
-                content: build_system_prompt(period).to_string(),
-            },
-            ChatMessage {
-                role: "user".to_string(),
-                content: user_prompt,
-            },
-        ],
-    };
-
-    let url = build_chat_completions_url(&base_url);
+    let api_mode = detect_api_mode(&base_url);
     let client = Client::new();
-    let response = client
-        .post(url)
-        .bearer_auth(api_key)
-        .json(&request)
-        .send()
-        .await
-        .map_err(|e| format!("请求 AI 接口失败: {e}"))?;
+    let response = match api_mode {
+        AiApiMode::ChatCompletions => {
+            let request = ChatCompletionRequest {
+                model,
+                temperature: 0.2,
+                messages: vec![
+                    ChatMessage {
+                        role: "system".to_string(),
+                        content: system_prompt,
+                    },
+                    ChatMessage {
+                        role: "user".to_string(),
+                        content: user_prompt,
+                    },
+                ],
+            };
+
+            let url = build_chat_completions_url(&base_url);
+            client
+                .post(url)
+                .bearer_auth(api_key)
+                .json(&request)
+                .send()
+                .await
+                .map_err(|e| format!("请求 AI 接口失败: {e}"))?
+        }
+        AiApiMode::AnthropicMessages => {
+            let request = AnthropicMessagesRequest {
+                model,
+                max_tokens: 4096,
+                temperature: 0.2,
+                system: system_prompt,
+                messages: vec![ChatMessage {
+                    role: "user".to_string(),
+                    content: user_prompt,
+                }],
+            };
+            let url = build_anthropic_messages_url(&base_url);
+            client
+                .post(url)
+                .header("x-api-key", &api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .json(&request)
+                .send()
+                .await
+                .map_err(|e| format!("请求 AI 接口失败: {e}"))?
+        }
+    };
 
     let status = response.status();
     let body = response
@@ -145,31 +173,13 @@ pub async fn generate_ai_report(
         ));
     }
 
-    let parsed: ChatCompletionResponse =
-        serde_json::from_str(&body).map_err(|e| format!("解析 AI 响应失败: {e}"))?;
-    let first = parsed
-        .choices
-        .first()
-        .ok_or_else(|| "AI 响应为空，没有可用内容".to_string())?;
-    let content = extract_text_content(&first.message.content)
-        .ok_or_else(|| "AI 响应格式异常，未找到文本内容".to_string())?;
+    let content = parse_ai_response_text(&body)?;
     let trimmed = content.trim();
     if trimmed.is_empty() {
         return Err("AI 返回内容为空，请稍后重试".to_string());
     }
 
     Ok(trimmed.to_string())
-}
-
-fn normalize_config_field(raw: Option<&str>) -> Option<String> {
-    raw.and_then(|s| {
-        let trimmed = s.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    })
 }
 
 fn parse_rfc3339_utc(raw: &Option<String>) -> Option<DateTime<Utc>> {
@@ -366,6 +376,122 @@ fn build_chat_completions_url(base_url: &str) -> String {
     }
 }
 
+fn build_anthropic_messages_url(base_url: &str) -> String {
+    let normalized = base_url.trim().trim_end_matches('/');
+    if normalized.ends_with("/v1/messages") {
+        return normalized.to_string();
+    }
+    if normalized.ends_with("/anthropic/v1") {
+        return format!("{normalized}/messages");
+    }
+    if normalized.ends_with("/anthropic") {
+        return format!("{normalized}/v1/messages");
+    }
+    if normalized.ends_with("/v1") {
+        return format!("{normalized}/messages");
+    }
+    format!("{normalized}/v1/messages")
+}
+
+fn detect_api_mode(base_url: &str) -> AiApiMode {
+    let normalized = base_url.trim().to_lowercase();
+    if normalized.contains("/anthropic") || normalized.ends_with("/v1/messages") {
+        AiApiMode::AnthropicMessages
+    } else {
+        AiApiMode::ChatCompletions
+    }
+}
+
+fn parse_ai_response_text(body: &str) -> Result<String, String> {
+    let parsed: Value =
+        serde_json::from_str(body).map_err(|e| format!("解析 AI 响应失败: {e}"))?;
+
+    if let Some(error_message) = extract_ai_error_message(&parsed) {
+        return Err(format!("AI 接口返回错误: {error_message}"));
+    }
+
+    let content = extract_openai_response_text(&parsed)
+        .or_else(|| extract_anthropic_response_text(&parsed))
+        .or_else(|| extract_generic_response_text(&parsed))
+        .ok_or_else(|| {
+            format!(
+                "AI 响应格式异常，未找到文本内容。响应片段: {}",
+                truncate_text(body, 240)
+            )
+        })?;
+
+    Ok(content)
+}
+
+fn extract_ai_error_message(payload: &Value) -> Option<String> {
+    if let Some(error) = payload.get("error") {
+        if let Some(msg) = error.as_str() {
+            return Some(msg.to_string());
+        }
+        if let Some(msg) = error.get("message").and_then(Value::as_str) {
+            if let Some(err_type) = error.get("type").and_then(Value::as_str) {
+                return Some(format!("{err_type}: {msg}"));
+            }
+            return Some(msg.to_string());
+        }
+        if let Some(msg) = error.get("msg").and_then(Value::as_str) {
+            return Some(msg.to_string());
+        }
+    }
+
+    if payload.get("choices").is_none() && payload.get("content").is_none() {
+        if let Some(msg) = payload.get("message").and_then(Value::as_str) {
+            return Some(msg.to_string());
+        }
+        if let Some(msg) = payload.get("msg").and_then(Value::as_str) {
+            return Some(msg.to_string());
+        }
+    }
+
+    None
+}
+
+fn extract_openai_response_text(payload: &Value) -> Option<String> {
+    let first = payload
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())?;
+
+    if let Some(content) = first.get("message").and_then(|message| message.get("content")) {
+        return extract_text_content(content);
+    }
+
+    first
+        .get("text")
+        .and_then(Value::as_str)
+        .map(|text| text.to_string())
+}
+
+fn extract_anthropic_response_text(payload: &Value) -> Option<String> {
+    if let Some(output_text) = payload.get("output_text").and_then(Value::as_str) {
+        return Some(output_text.to_string());
+    }
+
+    if let Some(completion) = payload.get("completion").and_then(Value::as_str) {
+        return Some(completion.to_string());
+    }
+
+    payload.get("content").and_then(extract_text_content)
+}
+
+fn extract_generic_response_text(payload: &Value) -> Option<String> {
+    if let Some(message_content) = payload.get("message").and_then(|message| message.get("content"))
+    {
+        return extract_text_content(message_content);
+    }
+
+    if let Some(text) = payload.get("text").and_then(Value::as_str) {
+        return Some(text.to_string());
+    }
+
+    None
+}
+
 fn extract_text_content(content: &Value) -> Option<String> {
     match content {
         Value::String(text) => Some(text.clone()),
@@ -399,7 +525,11 @@ fn truncate_text(text: &str, max_len: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::build_chat_completions_url;
+    use super::{
+        build_anthropic_messages_url, build_chat_completions_url, detect_api_mode,
+        parse_ai_response_text, AiApiMode,
+    };
+    use serde_json::json;
 
     #[test]
     fn build_chat_url_from_base_url() {
@@ -415,5 +545,84 @@ mod tests {
             build_chat_completions_url("https://example.com/chat/completions"),
             "https://example.com/chat/completions"
         );
+    }
+
+    #[test]
+    fn build_anthropic_messages_url_from_base_url() {
+        assert_eq!(
+            build_anthropic_messages_url("https://open.bigmodel.cn/api/anthropic"),
+            "https://open.bigmodel.cn/api/anthropic/v1/messages"
+        );
+        assert_eq!(
+            build_anthropic_messages_url("https://open.bigmodel.cn/api/anthropic/v1"),
+            "https://open.bigmodel.cn/api/anthropic/v1/messages"
+        );
+        assert_eq!(
+            build_anthropic_messages_url("https://open.bigmodel.cn/api/anthropic/v1/messages"),
+            "https://open.bigmodel.cn/api/anthropic/v1/messages"
+        );
+    }
+
+    #[test]
+    fn detect_api_mode_from_base_url() {
+        assert!(matches!(
+            detect_api_mode("https://open.bigmodel.cn/api/anthropic"),
+            AiApiMode::AnthropicMessages
+        ));
+        assert!(matches!(
+            detect_api_mode("https://api.openai.com/v1"),
+            AiApiMode::ChatCompletions
+        ));
+    }
+
+    #[test]
+    fn parse_openai_compatible_response() {
+        let body = json!({
+            "choices": [
+                {
+                    "message": {
+                        "content": "本周完成了三个核心需求交付。"
+                    }
+                }
+            ]
+        })
+        .to_string();
+
+        let text = parse_ai_response_text(&body).expect("should parse");
+        assert_eq!(text, "本周完成了三个核心需求交付。");
+    }
+
+    #[test]
+    fn parse_anthropic_response() {
+        let body = json!({
+            "id": "msg_123",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "本周完成了 A/B/C 三项重点工作。"
+                }
+            ]
+        })
+        .to_string();
+
+        let text = parse_ai_response_text(&body).expect("should parse");
+        assert_eq!(text, "本周完成了 A/B/C 三项重点工作。");
+    }
+
+    #[test]
+    fn parse_error_payload_returns_message() {
+        let body = json!({
+            "error": {
+                "type": "invalid_request_error",
+                "message": "model not found"
+            }
+        })
+        .to_string();
+
+        let err = parse_ai_response_text(&body).expect_err("should fail");
+        assert!(err.contains("invalid_request_error"));
+        assert!(err.contains("model not found"));
     }
 }

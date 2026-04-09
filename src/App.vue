@@ -38,6 +38,7 @@ const {
   currentSettings,
   sortOrder,
   todos,
+  storageError,
 } = storeToRefs(todoStore);
 const {
   toggleTodo,
@@ -47,6 +48,7 @@ const {
   moveToTrash,
   restoreTodo,
   permanentlyDeleteTodo,
+  clearStorageError,
 } = todoStore;
 
 onMounted(() => {
@@ -134,7 +136,7 @@ function startEditTask(todo: TodoItemModel) {
   isTaskModalOpen.value = true;
 }
 
-function submitTask() {
+async function submitTask() {
   if (!taskForm.value.title.trim()) return;
   if (!taskForm.value.categoryId) return;
 
@@ -144,12 +146,12 @@ function submitTask() {
     const taskId = editingTaskId.value;
     if (taskId === null) return;
 
-    updateTodo(
-      taskId,
-      taskForm.value.title.trim(),
-      taskForm.value.priority,
-      taskForm.value.categoryId,
-      taskForm.value.description.trim(),
+    await updateTodo(
+        taskId,
+        taskForm.value.title.trim(),
+        taskForm.value.priority,
+        taskForm.value.categoryId,
+        taskForm.value.description.trim(),
     );
 
     taskSaveSuccess.value = true;
@@ -159,7 +161,7 @@ function submitTask() {
       taskSaveSuccessTimer = null;
     }, 1800);
   } else {
-    todoStore.addTodo(
+    await todoStore.addTodo(
       taskForm.value.title.trim(),
       taskForm.value.priority,
       taskForm.value.categoryId,
@@ -389,6 +391,11 @@ function handleSelectCategory(id: string | null) {
         @open-settings="openSettingsModal"
       />
 
+      <div v-if="storageError" class="storage-error-bar">
+        <span class="storage-error-text">存储操作失败: {{ storageError }}</span>
+        <button class="storage-error-dismiss" @click="clearStorageError">&times;</button>
+      </div>
+
       <div class="layout-content">
         <div class="content-wrapper">
           <div class="main-list-column">
@@ -552,5 +559,42 @@ function handleSelectCategory(id: string | null) {
   border: 1px dashed var(--c-border);
   border-radius: var(--radius-md);
   margin-top: 20px;
+}
+
+.storage-error-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 16px;
+  margin: 0 24px;
+  background: #fef2f2;
+  border: 1px solid #fca5a5;
+  border-radius: var(--radius-md);
+  color: #dc2626;
+  font-size: 13px;
+}
+
+.storage-error-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.storage-error-dismiss {
+  flex-shrink: 0;
+  border: none;
+  background: none;
+  color: #dc2626;
+  font-size: 18px;
+  cursor: pointer;
+  padding: 0 4px;
+  line-height: 1;
+}
+
+.storage-error-dismiss:hover {
+  opacity: 0.7;
 }
 </style>

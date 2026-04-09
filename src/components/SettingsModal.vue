@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { onBeforeUnmount, ref } from 'vue';
+
 const props = defineProps<{
   visible: boolean;
   theme: string;
@@ -45,6 +47,59 @@ function updateDataFormat(event: Event) {
 function reportPeriodLabel(period: 'weekly' | 'monthly') {
   return period === 'weekly' ? '周报' : '月报';
 }
+
+const copyState = ref<'idle' | 'success' | 'error'>('idle');
+let copyStateTimer: ReturnType<typeof setTimeout> | null = null;
+
+function scheduleResetCopyState() {
+  if (copyStateTimer !== null) {
+    clearTimeout(copyStateTimer);
+  }
+  copyStateTimer = setTimeout(() => {
+    copyState.value = 'idle';
+    copyStateTimer = null;
+  }, 1800);
+}
+
+function fallbackCopyText(text: string) {
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.style.position = 'fixed';
+  textarea.style.opacity = '0';
+  textarea.setAttribute('readonly', 'true');
+  document.body.appendChild(textarea);
+  textarea.select();
+  const copied = document.execCommand('copy');
+  document.body.removeChild(textarea);
+  if (!copied) {
+    throw new Error('fallback copy failed');
+  }
+}
+
+async function copyReportContent() {
+  const content = props.reportContent.trim();
+  if (!content) return;
+
+  try {
+    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(content);
+    } else {
+      fallbackCopyText(content);
+    }
+    copyState.value = 'success';
+  } catch {
+    copyState.value = 'error';
+  } finally {
+    scheduleResetCopyState();
+  }
+}
+
+onBeforeUnmount(() => {
+  if (copyStateTimer !== null) {
+    clearTimeout(copyStateTimer);
+    copyStateTimer = null;
+  }
+});
 </script>
 
 <template>
@@ -187,7 +242,19 @@ function reportPeriodLabel(period: 'weekly' | 'monthly') {
               </div>
               <div v-if="props.reportError" class="settings-alert settings-alert-error">⚠️ {{ props.reportError }}</div>
               <div v-if="props.reportContent" class="report-preview">
-                <h4 class="report-preview-title">AI {{ reportPeriodLabel(props.reportPeriod) }}预览</h4>
+                <div class="report-preview-header">
+                  <h4 class="report-preview-title">AI {{ reportPeriodLabel(props.reportPeriod) }}预览</h4>
+                  <button
+                    class="btn-ghost report-copy-btn"
+                    type="button"
+                    :class="{ 'is-success': copyState === 'success', 'is-error': copyState === 'error' }"
+                    @click="copyReportContent"
+                  >
+                    <span v-if="copyState === 'success'">已复制</span>
+                    <span v-else-if="copyState === 'error'">复制失败</span>
+                    <span v-else>复制</span>
+                  </button>
+                </div>
                 <pre class="report-preview-content">{{ props.reportContent }}</pre>
               </div>
             </div>
@@ -313,13 +380,35 @@ function reportPeriodLabel(period: 'weekly' | 'monthly') {
   overflow: hidden;
 }
 
+.report-preview-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--c-border-light);
+}
+
 .report-preview-title {
   margin: 0;
-  padding: 10px 12px;
   font-size: 0.85rem;
   font-weight: 600;
   color: var(--c-text-secondary);
-  border-bottom: 1px solid var(--c-border-light);
+}
+
+.report-copy-btn {
+  min-width: 72px;
+  padding: 4px 10px;
+  font-size: 0.78rem;
+  justify-content: center;
+}
+
+.report-copy-btn.is-success {
+  color: var(--c-success);
+}
+
+.report-copy-btn.is-error {
+  color: var(--c-danger);
 }
 
 .report-preview-content {

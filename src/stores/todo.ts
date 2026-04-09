@@ -21,6 +21,7 @@ import {
   createTodoMutationStrategies,
   type TodoMutationStrategy,
 } from '@/stores/todoMutationStrategy';
+import { normalizeOptionalText } from '@/utils/text';
 
 function normalizePriority(priority: unknown): TaskPriority {
   if (isTaskPriority(priority)) {
@@ -442,6 +443,7 @@ export const useTodoStore = defineStore('todo', () => {
     try {
       await operation(currentMutationStrategy.value);
     } catch (err) {
+      console.error('[TodoStore] 变更操作失败:', err);
       storageError.value = String(err);
     }
   }
@@ -452,9 +454,14 @@ export const useTodoStore = defineStore('todo', () => {
     try {
       return await operation(currentMutationStrategy.value);
     } catch (err) {
+      console.error('[TodoStore] 变更操作失败:', err);
       storageError.value = String(err);
       return undefined;
     }
+  }
+
+  function clearStorageError() {
+    storageError.value = null;
   }
 
   async function toggleTodo(id: number) {
@@ -510,11 +517,6 @@ export const useTodoStore = defineStore('todo', () => {
 
   // ─── 设置更新 ─────────────────────────────────────
 
-  function normalizeOptionalText(value?: string): string | undefined {
-    const trimmed = value?.trim();
-    return trimmed ? trimmed : undefined;
-  }
-
   async function updateSettings(
     newType: 'json' | 'sqlite',
     newDataDir?: string,
@@ -554,6 +556,7 @@ export const useTodoStore = defineStore('todo', () => {
     isSearching,
     storageError,
     currentSettings,
+    clearStorageError,
     initialize,
     toggleTodo,
     addTodo,

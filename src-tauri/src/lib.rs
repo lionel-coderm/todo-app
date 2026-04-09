@@ -1,9 +1,11 @@
 mod ai_report;
 mod models;
 mod storage;
+mod utils;
 
 use models::{AppData, AppSettings, CategoryItem, CreateTodoInput, SearchTodosQuery, TodoItem};
 use storage::{json_storage::JsonStorage, sqlite_storage::SqliteStorage, StorageBackend};
+use utils::normalize_optional_text;
 
 use std::collections::HashMap;
 use std::fs;
@@ -120,22 +122,18 @@ fn effective_data_dir(app: &tauri::AppHandle, settings: &AppSettings) -> Result<
     get_system_dir(app)
 }
 
-fn normalize_optional_field(value: Option<String>) -> Option<String> {
-    value.and_then(|raw| {
-        let trimmed = raw.trim().to_string();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed)
-        }
-    })
-}
-
 fn normalize_settings(mut settings: AppSettings) -> AppSettings {
-    settings.data_dir = normalize_optional_field(settings.data_dir.take());
-    settings.ai_model = normalize_optional_field(settings.ai_model.take());
-    settings.ai_base_url = normalize_optional_field(settings.ai_base_url.take());
-    settings.ai_api_key = normalize_optional_field(settings.ai_api_key.take());
+    let data_dir = settings.data_dir.take();
+    settings.data_dir = normalize_optional_text(data_dir.as_deref());
+
+    let ai_model = settings.ai_model.take();
+    settings.ai_model = normalize_optional_text(ai_model.as_deref());
+
+    let ai_base_url = settings.ai_base_url.take();
+    settings.ai_base_url = normalize_optional_text(ai_base_url.as_deref());
+
+    let ai_api_key = settings.ai_api_key.take();
+    settings.ai_api_key = normalize_optional_text(ai_api_key.as_deref());
     settings
 }
 
